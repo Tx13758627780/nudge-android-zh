@@ -1,0 +1,67 @@
+<resources>
+    <string name="backup_import_title">Import backup</string>
+    <string name="backup_import">Import</string>
+    <string name="backup_cancel">Cancel</string>
+    <string name="backup_ok">OK</string>
+    <string name="backup_import_complete">Import Complete</string>
+    <string name="backup_import_failed">Import Failed</string>
+    <string name="backup_save_title">Save backup</string>
+    <string name="backup_share_title">Share backup</string>
+    <string name="backup_import_protection_challenge">Import settings that reduce protection</string>
+    <string name="backup_preview_rules">Import %1$d rule(s)?</string>
+    <string name="backup_preview_rules_groups">Import %1$d rule(s) and %2$d group(s)?</string>
+    <string name="backup_duplicates_warning">Duplicate rules will be skipped.</string>
+    <string name="backup_preview_history">Includes %1$d history event(s) (%2$d new).</string>
+    <plurals name="backup_preview_invalid_entries">
+        <item quantity="one">%1$d entry could not be read and will be left out:</item>
+        <item quantity="other">%1$d entries could not be read and will be left out:</item>
+    </plurals>
+    <plurals name="backup_preview_invalid_history">
+        <item quantity="one">%1$d history event could not be read and will be left out:</item>
+        <item quantity="other">%1$d history events could not be read and will be left out:</item>
+    </plurals>
+    <plurals name="backup_preview_invalid_settings">
+        <item quantity="one">%1$d setting could not be read and will be left out:</item>
+        <item quantity="other">%1$d settings could not be read and will be left out:</item>
+    </plurals>
+    <string name="backup_settings_warning">Also restores app settings, replacing this device\'s.</string>
+    <string name="backup_outcome_rules">Imported: %1$d rule(s)</string>
+    <string name="backup_outcome_groups">Groups created: %1$d</string>
+    <string name="backup_outcome_duplicates">Skipped (duplicates): %1$d</string>
+    <string name="backup_outcome_history">History events restored: %1$d</string>
+    <string name="backup_outcome_history_duplicates">History already present: %1$d</string>
+    <string name="backup_outcome_history_invalid">History could not be read: %1$d</string>
+    <string name="backup_outcome_settings">App settings restored</string>
+    <string name="backup_outcome_settings_invalid">Settings that could not be read: %1$d</string>
+    <string name="backup_outcome_invalid">Skipped (could not be read): %1$d</string>
+    <string name="backup_more_reasons">...and %1$s more</string>
+    <string name="backup_save_success">Backup saved. It holds your rules, your history and your app settings.</string>
+    <string name="backup_save_failure">Could not write the backup there. Try again, or pick a different folder.</string>
+    <string name="backup_read_failure">Could not read that file.</string>
+    <string name="backup_invalid_version">Invalid or missing version field</string>
+    <string name="backup_newer_version">Export version %1$s is newer than supported (%2$s). Please update the app.</string>
+    <string name="backup_all_invalid">No valid rules or groups found. All %1$s entries were invalid:\n%2$s</string>
+    <string name="backup_invalid_json">Invalid JSON format: %1$s</string>
+    <string name="backup_invalid_data">Invalid data: %1$s</string>
+    <string name="backup_unknown_mode">Unknown block mode: %1$s</string>
+    <string name="backup_missing_value">No value for %1$s</string>
+    <string name="backup_blank_package">Package name is blank</string>
+    <string name="backup_blank_group">Group name is blank</string>
+    <string name="backup_invalid_timestamp">Timestamp is not a positive epoch-millisecond value</string>
+    <string name="backup_unreadable">could not be read</string>
+    <string name="backup_not_boolean">is not true or false</string>
+    <string name="backup_not_text">is not text</string>
+    <string name="backup_not_number">is not a number</string>
+    <string name="backup_reason_rule">Rule %1$s: %2$s</string>
+    <string name="backup_reason_group">Group %1$s: %2$s</string>
+    <string name="backup_reason_history">History event %1$s: %2$s</string>
+    <string name="backup_reason_setting">Setting \"%1$s\": %2$s</string>
+    <string name="backup_invalid_challenge_length">challenge length %1$s is outside 1..%2$s</string>
+    <string name="backup_field_array">\"%1$s\" must be an array</string>
+    <string name="backup_field_object">\"%1$s\" must be an object</string>
+    <string name="backup_field_missing_text">\"%1$s\" is missing or is not text</string>
+    <string name="backup_field_missing_number">\"%1$s\" is missing or is not a number</string>
+    <string name="backup_field_boolean">\"%1$s\" is not true or false</string>
+    <string name="backup_field_text">\"%1$s\" is not text</string>
+    <string name="backup_unrecognized_diagnostic">%1$s</string>
+</resources>

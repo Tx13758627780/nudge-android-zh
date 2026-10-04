@@ -1,0 +1,223 @@
+package com.astraedus.nudge.ui.overlay
+
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import com.astraedus.nudge.R
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.delay
+
+@Composable
+fun DelayContent(
+    delaySeconds: Int,
+    onComplete: () -> Unit,
+    onCancel: () -> Unit,
+    ruleName: String? = null,
+    appLabel: String? = null,
+    dailyTimeRemainingMs: Long? = null,
+    dailyLimitMinutes: Int? = null,
+    titlePool: List<String>? = null,
+    subtitlePool: List<String>? = null,
+    canUseEmergencyPass: Boolean = false,
+    emergencyLocked: Boolean = false,
+    nextPassMs: Long = 0L,
+    onUseEmergencyPass: () -> Unit = {}
+) {
+    val resolvedTitlePool = titlePool ?: localizedDelayTitles(LocalContext.current)
+    val title = remember { resolvedTitlePool.random() }
+    val resolvedSubtitlePool = subtitlePool ?: localizedDelaySubtitles(LocalContext.current)
+    val subtitle = remember { resolvedSubtitlePool.random() }
+    // Unkeyed by design: BlockOverlayActivity composes this subtree under a per-delivery key, so a
+    // new block already gets fresh state (issue #15). Keying here on delaySeconds would look like a
+    // fix but miss the common case — two apps both on the default 15s delay would still share it.
+    var remainingSeconds by remember { mutableIntStateOf(delaySeconds) }
+
+    val progress by animateFloatAsState(
+        targetValue = if (delaySeconds > 0) remainingSeconds.toFloat() / delaySeconds.toFloat() else 0f,
+        animationSpec = tween(durationMillis = 900),
+        label = "countdown_progress"
+    )
+
+    // The countdown ticks ONLY while the overlay is actually on screen (issue #8). A plain
+    // LaunchedEffect(Unit) is not frame-gated: `delay()` kept counting after the user tabbed out,
+    // so the timer reached zero invisibly and granted passthrough while they were on the launcher —
+    // returning to the app then opened it with no delay at all. `remainingSeconds` is remembered
+    // OUTSIDE this block, so a pause resumes where it left off instead of restarting.
+    //
+    // repeatOnLifecycle cancels the block below RESUMED and starts a NEW one from the top on
+    // re-entry, so once the count has reached zero a pause/resume cycle would fall straight through
+    // the loop and fire onComplete a second time. The guard makes completion exactly-once —
+    // onComplete grants passthrough, and this path must never be able to grant it twice.
+    val completed = remember { AtomicBoolean(false) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            while (remainingSeconds > 0) {
+                delay(1000L)
+                remainingSeconds--
+                // "X left today" is deliberately NOT ticked down here: while this overlay is up the
+                // blocked app is paused, so UsageStatsManager accrues nothing against the budget.
+                // Draining the display would show the user spending time they are not spending.
+            }
+            if (completed.compareAndSet(false, true)) onComplete()
+        }
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                // targetSdk 36 enforces edge-to-edge with no opt-out, so the window now spans
+                // under the status and navigation bars. The Surface above stays full-bleed (the
+                // block must cover every pixel of the app behind it); only the CONTENT is inset.
+                .safeDrawingPadding()
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            // App name + daily time remaining
+            if (appLabel != null) {
+                Text(
+                    text = appLabel,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (dailyTimeRemainingMs != null && dailyLimitMinutes != null && dailyLimitMinutes > 0) {
+                    Text(
+                        text = stringResource(R.string.overlay_left_today, localizedDuration(dailyTimeRemainingMs)),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = timeRemainingColor(dailyTimeRemainingMs, dailyLimitMinutes)
+                    )
+                }
+                Spacer(modifier = Modifier.height(24.dp))
+            }
+
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier.size(180.dp)
+            ) {
+                CircularProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier.size(180.dp),
+                    strokeWidth = 8.dp,
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+
+                Text(
+                    text = "$remainingSeconds",
+                    style = MaterialTheme.typography.displayLarge.copy(fontSize = 56.sp),
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.onBackground,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.height(48.dp))
+
+            OutlinedButton(onClick = onCancel) {
+                Text(stringResource(R.string.interaction_changed_mind))
+            }
+
+            EmergencyPassAction(
+                canUse = canUseEmergencyPass,
+                locked = emergencyLocked,
+                nextPassMs = nextPassMs,
+                onUse = onUseEmergencyPass
+            )
+
+            if (ruleName != null) {
+                Spacer(modifier = Modifier.height(24.dp))
+                Text(
+                    text = stringResource(R.string.overlay_rule, ruleName),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline.copy(alpha = 0.7f),
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+    }
+}
+
+internal fun formatDuration(ms: Long): String {
+    if (ms <= 0) return "0m"
+    val totalMinutes = ms / 60_000
+    val hours = totalMinutes / 60
+    val minutes = totalMinutes % 60
+    return when {
+        hours > 0 -> "${hours}h ${minutes}m"
+        else -> "${minutes}m"
+    }
+}
+
+@Composable
+internal fun timeRemainingColor(remainingMs: Long, limitMinutes: Int): androidx.compose.ui.graphics.Color {
+    val limitMs = limitMinutes.toLong() * 60_000L
+    val pct = if (limitMs > 0) remainingMs.toFloat() / limitMs else 1f
+    return when {
+        pct > 0.50f -> MaterialTheme.colorScheme.primary
+        pct > 0.25f -> MaterialTheme.colorScheme.tertiary
+        else -> MaterialTheme.colorScheme.error
+    }
+}
+
+/** Resource-backed time units for overlay presentation, leaving the pure formatter unchanged. */
+@Composable
+internal fun localizedDuration(ms: Long): String {
+    val totalMinutes = (ms.coerceAtLeast(0L) / 60_000L)
+    val hours = totalMinutes / 60L
+    val minutes = totalMinutes % 60L
+    return if (hours > 0) {
+        stringResource(R.string.component_duration_hours_minutes, hours, minutes)
+    } else {
+        stringResource(R.string.component_duration_minutes, minutes)
+    }
+}

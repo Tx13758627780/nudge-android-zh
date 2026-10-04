@@ -1,0 +1,225 @@
+package com.astraedus.nudge
+
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.astraedus.nudge.data.preferences.NudgePreferences
+import com.astraedus.nudge.service.NudgeMonitorService
+import com.astraedus.nudge.ui.theme.NudgeTheme
+import com.astraedus.nudge.ui.navigation.NudgeNavGraph
+import com.astraedus.nudge.ui.widget.WidgetDeepLink
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+@AndroidEntryPoint
+class MainActivity : ComponentActivity() {
+
+    @Inject
+    lateinit var nudgePreferences: NudgePreferences
+
+    private val requestNotificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* no-op */ }
+
+    /**
+     * The route a notification or a home-screen widget asked us to open, until the nav graph has
+     * consumed it.
+     *
+     * State rather than a value read once in [onCreate], because this Activity is `singleTop`: a
+     * widget tapped while the app is already running delivers through [onNewIntent] with no new
+     * composition to read the intent. Cleared on consumption so tapping the SAME widget again, after
+     * navigating away, navigates again rather than being swallowed as an unchanged key.
+     */
+    private var deepLinkRoute by mutableStateOf<String?>(null)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        keepMonitorServiceInSync()
+        retryRefusedServiceStartOnResume()
+        requestNotificationPermissionIfNeeded()
+
+        deepLinkRoute = routeFrom(intent)
+
+        setContent {
+            NudgeTheme {
+                NudgeNavGraph(
+                    nudgePreferences = nudgePreferences,
+                    deepLinkRoute = deepLinkRoute,
+                    onDeepLinkConsumed = { consumeDeepLink() }
+                )
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        // setIntent so getIntent() and this state cannot disagree about which intent is current.
+        setIntent(intent)
+        deepLinkRoute = routeFrom(intent)
+    }
+
+    /**
+     * Forgets the pending route, AND strips it from the Intent that carried it.
+     *
+     * Clearing only the state was a bug: `onCreate` re-reads `intent` on every creation, and a
+     * configuration change (rotation, theme switch, font-size change) destroys and recreates the
+     * Activity with the SAME Intent. So after tapping a widget and navigating on to somewhere else,
+     * a rotation silently threw the user back to the widget's target - repeatedly, for the life of
+     * that task. The Intent is the thing that survives recreation, so the Intent is the thing that
+     * has to be emptied.
+     *
+     * Every extra [routeFrom] reads must be cleared here or the bug comes straight back for that
+     * one mechanism; `DeepLinkConsumptionContractTest` pins that the two lists stay in step.
+     */
+    private fun consumeDeepLink() {
+        deepLinkRoute = null
+        intent?.let { current ->
+            current.removeExtra(WidgetDeepLink.EXTRA_ROUTE)
+            current.removeExtra(EXTRA_OPEN_SETTINGS)
+            // setIntent so a later getIntent() cannot hand back the un-stripped original.
+            setIntent(current)
+        }
+    }
+
+    /**
+     * ONE reader for both deep-link mechanisms.
+     *
+     * [EXTRA_OPEN_SETTINGS] is translated into a route rather than kept as a parallel path. Its
+     * `PendingIntent` is already sitting inside protection alerts posted on real phones, so the
+     * constant has to keep working, but it does not have to keep being a second mechanism, and
+     * `WidgetDeepLink.routeFor` refusing an unknown route protects both.
+     */
+    private fun routeFrom(intent: Intent?): String? {
+        if (intent == null) return null
+        if (intent.getBooleanExtra(EXTRA_OPEN_SETTINGS, false)) return WidgetDeepLink.ROUTE_SETTINGS
+        return WidgetDeepLink.routeFor(intent.getStringExtra(WidgetDeepLink.EXTRA_ROUTE))
+    }
+
+    /**
+     * The app's real start path for the foreground service.
+     *
+     * `NudgeMonitorService` used to be started from exactly one place — a `BOOT_COMPLETED`
+     * broadcast — so a fresh install ran with no process-priority protection at all until the
+     * user's next reboot, and every app update took it away again. One observer here covers all
+     * three moments monitoring should come up, because each of them is a change in this same pair
+     * of flags while this Activity is on screen:
+     *
+     *  - app launch with monitoring already on,
+     *  - the master toggle being switched on (or off — the service stops, because a "Nudge is
+     *    active" notification over disabled monitoring is a lie),
+     *  - onboarding completing, which writes `onboardingComplete` without ever leaving here.
+     *
+     * Gated on onboarding too, so a first-run user is not shown a notification claiming Nudge is
+     * monitoring before they have granted it anything to monitor with.
+     *
+     * It covers those three moments and no others, because it only fires when the pair of flags
+     * CHANGES. Healing a service that died while the flags stood still is the sibling observer's
+     * job: see [retryRefusedServiceStartOnResume].
+     */
+    private fun keepMonitorServiceInSync() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                shouldMonitor()
+                    .distinctUntilChanged()
+                    .collect { shouldMonitor ->
+                        // sync(), not start()/stop() by hand: one lifecycle API, so "the service
+                        // exists exactly when monitoring is on" is decided in one place rather
+                        // than at each of the four call sites that can change the answer.
+                        NudgeMonitorService.sync(this@MainActivity, shouldMonitor)
+                    }
+            }
+        }
+    }
+
+    /**
+     * Should monitoring be running right now: the master toggle AND onboarding, in one place.
+     *
+     * Extracted rather than written out at both observers below. The two ask the same question for
+     * different reasons - one watches for the answer to change, the other wants today's answer on
+     * every resume - and two hand-written copies of it would be two things to keep in step.
+     */
+    private fun shouldMonitor() = combine(
+        nudgePreferences.isGlobalEnabled,
+        nudgePreferences.isOnboardingComplete
+    ) { enabled, onboarded -> enabled && onboarded }
+
+    /**
+     * Brings the foreground service back on resume when the platform refused to let the watchdog
+     * do it (GitHub issue #62).
+     *
+     * Android 12+ forbids starting a foreground service from the background. The documented
+     * exemption list covers neither a bound accessibility service nor a WorkManager expedited job,
+     * so the "display over other apps" grant is the only thing that has ever made the watchdog's
+     * start legal, and onboarding lets the user skip it. On such a phone
+     * `NudgeMonitorService.start()` is denied every time the watchdog tries, and the watchdog has
+     * no other way to heal it.
+     *
+     * **A visible Activity is its own entry on that exemption list**, and it is the one we can
+     * reach from here, so a start made on resume cannot be refused on any API level. That matters
+     * more over time, not less: Android 16 narrows the overlay-permission exemption to apps that
+     * currently have a visible overlay window, so granting the permission stops being sufficient
+     * there and this observer becomes the reliable healer rather than the backstop.
+     *
+     * This has to be its own observer: [keepMonitorServiceInSync] is `distinctUntilChanged` over
+     * the same two flags, so for a returning user whose flags have not moved it emits nothing at
+     * all. The app would sit in the foreground, with the user looking straight at it, and never
+     * retry the start that only it is allowed to make.
+     *
+     * Gated on [NudgeMonitorService.isRunning] deliberately. An unconditional `sync()` on every
+     * resume would re-enter `onStartCommand` on a perfectly healthy service and re-post its ongoing
+     * notification, which is issue #63; this must repair a dead service without touching a live one.
+     *
+     * Do not "simplify" this away into [keepMonitorServiceInSync]. The protection alert's own tap
+     * target is this Activity, so with this observer in place **tapping the alert heals the fault
+     * it is reporting**, before the user has read a word of it. Delete this and that stops being
+     * true, silently, with every other test still green.
+     */
+    private fun retryRefusedServiceStartOnResume() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                if (shouldMonitor().first() && !NudgeMonitorService.isRunning) {
+                    NudgeMonitorService.start(this@MainActivity)
+                }
+            }
+        }
+    }
+
+    /**
+     * `POST_NOTIFICATIONS` is declared in the manifest but is a runtime grant from Android 13.
+     * Without it the watchdog's "blocking has stopped" alert is dropped on the floor and the
+     * ongoing monitor notification never appears — i.e. every cue that protection is alive or dead
+     * goes missing on exactly the modern devices this is meant to protect. Asking once on launch,
+     * with no dialog of our own, because the system prompt already explains itself and a refusal
+     * costs the user nothing else in the app.
+     */
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    companion object {
+        /** Set by the protection alert so its tap lands on the screen that fixes the problem. */
+        const val EXTRA_OPEN_SETTINGS = "nudge.open_settings"
+    }
+}

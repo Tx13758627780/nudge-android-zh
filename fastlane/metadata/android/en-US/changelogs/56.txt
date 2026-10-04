@@ -1,0 +1,6 @@
+• A finished delay or hold could be demanded again minutes later while still in the app. Fixed.
+• The notification was re-posted every 30 seconds, waking your phone all night. Now it posts only when its text changes.
+• If Android stops Nudge restarting itself, you are now told.
+• Home then reopening a blocked app sometimes skipped the block. Fixed.
+• A raised daily limit no longer shows the old limit screen.
+• Instagram's Following steer no longer re-fires after a screen timeout.

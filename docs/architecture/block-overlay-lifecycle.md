@@ -1,0 +1,208 @@
+# Block overlay lifecycle, the walk-away path, the daily pass, and the HOLD mode
+
+Covers `BlockOverlayActivity`'s lifecycle invariant (the delay only runs while you are looking at it),
+the "I changed my mind" walk-away write path that feeds every stat, the daily 2-minute escape hatch
+rendered on every overlay, and `BlockMode.HOLD`, the block whose timer only runs under a thumb.
+**Read before touching `ui/overlay/`, `RecordWalkAwayUseCase`, `HoldProgress`/`HoldTarget`,
+`EmergencyPass*`, or before adding a block mode.**
+
+## Block overlay lifecycle — the delay only runs while you are looking at it (fixes #8)
+
+Fix for [#8](https://github.com/astraedus/nudge/issues/8): the delay could be bypassed by tabbing out and back in. `BlockOverlayActivity` is `singleInstance` in its own task with an empty `taskAffinity`, so pressing Home mid-countdown only **stopped** it — the activity stayed alive in the background. The countdown ran as a plain `LaunchedEffect(Unit) { while (…) { delay(1000L); … } }`, which is **not** frame-gated (only recomposition pauses; `delay()` keeps running). The timer therefore hit zero invisibly while the user was on the launcher, called `onComplete()` → `passthroughManager.grant(pkg)` + `finish()`, and the next entry into the app hit `shouldSkipForegroundEvaluation` and opened with **zero** delay. The same stale background task is why the reporter saw the overlay/timer "persist" after tabbing out.
+
+**Invariant: the delay only progresses while the overlay is actually on screen, and leaving the overlay abandons the attempt entirely.** Three layers, outermost first:
+
+- **Finish on stop** — `BlockOverlayActivity.onStop()` clears `NudgeAccessibilityService.isOverlayActive` and `finish()`es, guarded by `!isFinishing` (the normal completion paths — `onTimerComplete` / `navigateHome` / emergency pass — already finished us) and `!isChangingConfigurations` (**a rotation must not dismiss a live block**). Home, a recents switch or screen-off therefore dismiss the overlay; the next entry into the blocked app is evaluated fresh and gets a fresh FULL delay. This also permanently removes the orphaned-overlay-task case that `isOverlayBypassedByForeground` exists to paper over.
+- **Lifecycle-gated tickers** — both countdowns run inside `lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED)` (`DelayContent`, `BreathingContent`), covering the `onPause`→`onStop` gap. `repeatOnLifecycle` **cancels and restarts from the top**, so all countdown state is `remember`ed OUTSIDE the block and a pause resumes rather than restarts. Uses `androidx.lifecycle.compose.LocalLifecycleOwner` (NOT the deprecated `androidx.compose.ui.platform` one); `repeatOnLifecycle` resolves from the existing `lifecycle-runtime-compose:2.8.7`, which carries `lifecycle-runtime-ktx` as an **api** dependency — no new Gradle dep needed.
+- **Defensive grant** — `onTimerComplete()` only calls `passthroughManager.grant()` when `lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)`. A countdown that somehow completed while backgrounded finishes without opening the app.
+- **Exactly-once completion** — `onComplete()` sits after the countdown loop *inside* the `repeatOnLifecycle` block, so once the count has reached zero a pause/resume cycle would fall straight through the loop and fire it again. Both composables guard it with an `AtomicBoolean.compareAndSet`. Not reachable today (`onTimerComplete` always `finish()`es, so the activity never returns to RESUMED after completing) — but `onComplete` **grants passthrough**, and this path must not depend on an invariant that lives in another file.
+- `BreathingContent` additionally accumulates elapsed time **per visible segment** (`advanceBreathingElapsed`/`breathingProgress`/`isBreathingComplete`, pure + unit-tested in `BreathingElapsedTest`) instead of measuring `now - startTime` from one timestamp — otherwise wall-clock time spent away from the overlay would still count toward completion. The accumulator clamps at zero so a backwards clock jump cannot rewind progress.
+- **Known cosmetic**: rotation recreates the activity, and countdown state is `remember` (not `rememberSaveable`), so the timer restarts at full length. Errs toward *more* delay, never less.
+- **Device-verified** (Pixel 3, 15s DELAY rule on Keep): Home mid-count → wait past the would-be expiry → return shows a fresh full delay with no passthrough grant in logcat; Home → immediate return shows 15/15, not a continued count; rotation mid-count keeps `BlockOverlayActivity` resumed.
+
+## The walk-away path — "I changed my mind" (2026-08-20)
+
+`navigateHome()` is the terminal path for the button on every overlay and for the back button. It is the ONLY writer of `userChangedMind = true`, so it is the sole source of the home screen's "Walked Away" tile and of every number on the Willpower insight page. It had no owner and no voice; both defects were silent, which is why the report arrived as "it just doesn't count".
+
+- **The write is a `@Singleton` use case, not a coroutine the activity spawns.** `domain/usecase/RecordWalkAwayUseCase.kt`. The old code did `CoroutineScope(Dispatchers.IO).launch { … }` inline: created per tap, parented to nothing, referenced by nothing, on an activity that `finish()`es microseconds later — a promise nobody held. Worse, `launch` without a `CoroutineExceptionHandler` propagates to the thread's default handler, so a Room/SQLite failure here would have **killed the process** and with it the accessibility service; losing one stat row must never stop blocking. The singleton scope carries a `SupervisorJob` + a handler that logs, and it outlives the activity by construction.
+- **It logs, unconditionally, both ways** (`walk-away recorded package=… mode=…` / `walk-away NOT recorded: insert failed`). Without this, "the row never appeared" and "the row appeared and the tile did not move" are indistinguishable from a device — the same trap that cost a release cycle on the PiP work.
+- **Going home uses `GLOBAL_ACTION_HOME`, not a HOME intent.** `startActivity(HOME)` then `finish()` was a race: this activity is singleInstance in its own task with an empty taskAffinity, so finishing pops back to the task underneath — the blocked app. That is the backlog item "'I changed my mind' can leave the user inside the blocked app". `NudgeAccessibilityService.requestGoHome()` is dispatched by the system, does not race our `finish()`, and is not subject to background activity-start restrictions; it is already how `EmergencyPassManager`, `AutoKickExecutor` and `StrictModeGuardActivity` leave an app. The HOME intent remains the fallback for when the service is not connected.
+- **Exactly one event per attempt** — a `walkedAway` `AtomicBoolean.compareAndSet` gate, because the button and the back button both land here. Verified on device: a triple tap and a back press each produce exactly one row.
+- **Never grants passthrough.** Turning around is not permission to enter — the next attempt gets a fresh, full block. (`onTimerComplete`, i.e. waiting it out, is the only path that may grant.) Guarded by `BlockOverlayWalkAwayContractTest`.
+- **The row shape is a cross-file contract.** A walk-away row carries `wasBlocked = true` **and** `userChangedMind = true`, i.e. one confrontation can be TWO rows. Every "Blocked" number therefore counts `wasBlocked && !userChangedMind` — `UsageEvent.isShownConfrontation` in memory, `AND userChangedMind = 0` in the DAO — and flipping `wasBlocked` here silently starts under-reporting. Until 1.17.2 only the insight screens applied that correction, so the home tile and the Today widget read a walk-away as two blocks (device: 210 blocked / 29 walked away for 181 real confrontations). Pinned by `RecordWalkAwayUseCaseTest.buildEvent` + `BlockedCountSemanticsContractTest`.
+- **Tests**: `RecordWalkAwayUseCaseTest` (row shape incl. every block mode, blank package, timestamp bucket, single insert, failure logged not thrown, success logged) and `BlockOverlayWalkAwayContractTest` — a SOURCE-level test, in the same spirit as `ContentFilterAssetTest` testing the shipped asset: the activity is not JVM-testable and the bug was not in any value, it was in the shape of the code, so the test fails on any future edit that reaches for a throwaway `CoroutineScope(…)` to write a stat, hand-rolls the go-home intent, drops the once-only gate, or grants passthrough while walking away.
+- **Device-verified** (Pixel 3 / Android 12, clean installs): release v1.13.0 (vc41) 3/3 rule-DELAY walk-aways recorded and landed on the launcher, home tiles reading Blocked 6 / Walked Away 3 off exactly those rows (that "6" is the double-count above, recorded here before it was understood as a bug; the same run reads Blocked 3 from 1.17.2 on); debug build 3/3 on the rule path plus the auto-kick **cooldown** overlay (the "post-lockout" repro) and the daily-pass-available layout.
+
+> **Diagnosing "the counter didn't move", start with the DB, not the tile.** The debug build is `run-as`-able: `adb shell "run-as dev.astraedus.nudge cat databases/nudge.db" > /tmp/n.db` **plus the `-wal`** (a fresh DB's whole schema can still be sitting in the WAL — the bare `.db` will look like an empty 4KB file), then `sqlite3 /tmp/n.db "select … from usage_events"`. Two ADB gotchas that will otherwise waste a cycle: `am force-stop dev.astraedus.nudge` **disables the accessibility service** (force-stop is the one event AOSP actively strips the component from `ENABLED_ACCESSIBILITY_SERVICES` for; `adb install -r` was observed to need the same re-enable, but note that is the ADB dev-install path and NOT what a Play in-place update does, `onPackageUpdateFinished` clears the crashed set and rebinds, see `ops/routes/nudge/research/service-resilience-audit-2026-09-06.md`) — re-enable with `settings put secure enabled_accessibility_services …` + `accessibility_enabled 1` and re-check `dumpsys accessibility`), and because `allowBackup=true` a reinstall can silently **restore an old cloud backup** over your clean slate, rules and all.
+
+
+### The "click twice" race: `GLOBAL_ACTION_HOME` does not stop the pop underneath it ([#26](https://github.com/astraedus/nudge/issues/26))
+
+Three reporters, every time: tap "I changed my mind" on a block overlay, land back on the blocked app instead of the launcher, and the block fires again as if the tap never happened. A second tap always got them out. The bench Pixel 3 never reproduced it once, across every device session run against it: the reproduction is device and launcher timing, not logic.
+
+`navigateHome()` used to dispatch `GLOBAL_ACTION_HOME` and call `finish()` on the very next line. `BlockOverlayActivity` is `singleInstance` in its own task with an empty `taskAffinity`, so `finish()` pops straight back to the task underneath, which is the blocked app's task. `GLOBAL_ACTION_HOME` is dispatched asynchronously: it is a request to the platform, not an instruction that completes before the next line runs. On a device where the launcher wins that race, nothing goes wrong. On a device where the finish's pop wins, the blocked app's window genuinely resurfaces, fires a real `TYPE_WINDOW_STATE_CHANGED`, for a real foreground app, with the overlay already gone and `isOverlayActive` already false. The 1000ms `DEBOUNCE_MS` is long past, because the user was sitting on the overlay reading it, so every gate in the service says "evaluate this app" and the block re-arms over an app the user had just declined. The second tap "works" only because by then the launcher has caught up and is where the pop lands.
+
+**The foreground check alone cannot fix this.** At the instant the phantom window event fires, the blocked app really IS in front, and there is no stale foreground to compare against, no package name lying about where it is. What is missing is not information about where the user is, it is that the service does not know a departure is already in flight. That is why this lives in the same gate as [#31](https://github.com/astraedus/nudge/issues/31) rather than as a second, narrower patch: both questions collapse into "is this decision still about where the user is going to be", and #26 needs the half of that answer that comes from the walk-away path itself, not from the accessibility stream.
+
+`navigateHome()` no longer calls `finish()`. In order, it now: records the walk-away, clears the overlay-active flag, arms `blockLaunchGuard.onWalkAwayStarted(passthroughPackage)` **before** dispatching the go-home (armed after would miss a resurfacing window event landing on the very next frame), dispatches `GLOBAL_ACTION_HOME` (falling back to a `HOME` intent when the service is not connected), and schedules `scheduleWalkAwayFinish()`. `onStop()` now does the actual `finish()`, once the launcher has genuinely stopped this activity: a finish issued from the background pops nothing forward, because there is no visible transition left to interrupt. Arming the walk-away tells the service, through `BlockLaunchGuard`'s pending `WalkAway`, that a departure for that package is in flight: if that same package's window resurfaces before the transition completes, `BlockLaunchGate.decide` returns `DROP_WALK_AWAY_IN_FLIGHT` instead of `LAUNCH`, and the phantom re-block that used to reach `BlockOverlayActivity` never gets there.
+
+`WALK_AWAY_FINISH_FAILSAFE_MS = 1200` covers the other failure direction: a `GLOBAL_ACTION_HOME` the platform accepted and never honoured, which would otherwise strand the user on an overlay whose buttons have already fired. If that fail-safe finish ever runs, it reproduces the old bug's pop on purpose, as a last resort, so it must land while the gate is still suppressing the block it would cause. It is deliberately **shorter** than `BlockLaunchGate.WALK_AWAY_TRANSITION_MS` (1500ms), and `BlockOverlayLaunchContractTest` pins the inequality between the two constants directly rather than leaving it to a comment, because the relationship spans two files and a comment living in only one of them is exactly how it would drift unnoticed.
+
+The window a walk-away arms closes on evidence, not the clock. `BlockLaunchGate.walkAwayAfter` drops it the moment a foreground signal proves the transition happened: `ForegroundSignal.Home` closes it outright, and any *other* app's window closes it too, since that is proof the departure completed by a different route. The one signal that must NOT close it is the blocked app's own window matching the armed package, since that is precisely the resurfacing #26 is about. `ForegroundSignal.OwnUi` also leaves it open, deliberately: the overlay finishing is itself Nudge UI on its way out, and its own dying window event arrives before the transition it is waiting for. Closing on it would make the window last approximately zero milliseconds and quietly restore #26.
+
+**Deferring the finish made `walkedAway` per-delivery.** That `AtomicBoolean` used to be latched for the life of the activity, which was correct only because `navigateHome` finished immediately: a re-delivered block always arrived on a fresh instance. Now the activity stays RESUMED for up to 1200ms, so a block for a DIFFERENT package delivered through `onNewIntent` inside that window renders on this same instance, and a latched flag would leave its "I changed my mind" and its back gesture both dead. On a `HARD_BLOCK`, which has no completion path, that is not a lost stat, it is a user with no way off the screen. `render` therefore resets it, and drops the previous attempt's pending fail-safe, exactly as it already resets `renderToken`. This cannot double-count one attempt: the only delivery that could be the SAME attempt is one for the same package, and `BlockLaunchGate.WALK_AWAY_TRANSITION_MS` refuses those for 1500ms, longer than the 1200ms this activity can survive a walk-away. The two constants were paired for the race above; they carry this too.
+
+Pinned by `BlockLaunchGateTest` (every branch of `decide` and `walkAwayAfter` in isolation), `BlockLaunchGuardReplayTest` (the reported sequence replayed through the real `EventClassifier` and `SittingTracker`, with a counterfactual proving the pre-fix rule really does launch on it, plus the fail-safe-timing case and the false-positive suite for the shade, the active keyboard, the framework package and a permission dialog), and `BlockOverlayLaunchContractTest` (source-level: the window is armed before `goHome()` runs, `navigateHome` no longer calls `finish()` inline, and the two timing constants stay in the right order), and `BlockOverlayWalkAwayContractTest`'s "a re-delivered block gets a fresh walk-away budget and fresh timers" (that `render` resets the once-only flag and cancels the stale fail-safe, and that `onNewIntent` reaches `render` so the reset actually applies to a re-delivery). Device QA for this fix is pending; the ordering that produces #26 is device and launcher timing the bench Pixel 3 has never shown, which is why the reproduction lives in the replay test instead.
+
+
+## ONE CONFRONTATION PER ARRIVAL — what a `wasBlocked` row means ([#36](https://github.com/astraedus/nudge/issues/36))
+
+> Read this before adding any block path, any overlay launch site, or anything that writes to `usage_events`.
+
+The report was *"Statistics page registered 2500 interventions on one day when baseline is a couple of hundred usually"*, on v1.17.1. 2500 is not a double count; at a second or two per round it is about two hours of a loop, and it needs no finger on the screen.
+
+**The structural cause is that "show an overlay" and "record an intervention" had one answer between them.** Every gate in this subsystem — `BlockLaunchGate.decide`, `isGenuineBypass`, the walk-away window, the foreground check — decides whether an overlay may be SHOWN, and each is correct about that. `handleDecision` then wrote a `UsageEvent` for every launch those gates allowed, so the count inherited a rule that was never about counting. Any mechanism that could put the overlay back up on its own also put a row in the database, once per iteration, forever.
+
+There are several such mechanisms and they are all legitimate behaviour:
+
+| Mechanism | What happens |
+|---|---|
+| **The overlay is stopped without finishing** (screen off, or the blocked app's task re-fronting on a device whose launcher loses that race) | `onStop` clears `isOverlayActive` and `finish()`es. The app resumes underneath and fires a genuine `TYPE_WINDOW_STATE_CHANGED`. Every gate is telling the truth — a real app really is in front with no overlay up — and the 1-second debounce was already defeated, because `clearOverlays(nudgePackage, "block_overlay_active")` moved `lastPackage` to Nudge. So it blocks again, and the overlay it puts up is stopped again. |
+| **Re-delivery starves the bypass rule** | A second block for the same target reaches the `singleInstance` activity through `onNewIntent`, which never re-runs `onResume`. `onOverlayLaunched` used to reset `windowShown` to false for an overlay that was on the screen, and nothing could ever set it back — so after `OVERLAY_SETTLE_MS` every trailing window event from the app underneath read as a bypass, each one worth a fresh evaluation and a fresh row, every three seconds. |
+| **A dying overlay clears a live one's state** | An overlay finishing from `onStop` has its `onDestroy` run AFTER the replacement instance's `onResume`. `onOverlayDismissed()` cleared unconditionally, wiping the live overlay's pending state and handing the newly blocked app's start-up windows straight back to the bypass rule. |
+| **The walk-away fail-safe pops the app back** | `WALK_AWAY_FINISH_FAILSAFE_MS` (1200ms) deliberately reproduces #26's pop when a `GLOBAL_ACTION_HOME` is accepted and never honoured. Armed only at the tap, the suppression window (`WALK_AWAY_TRANSITION_MS`, 1500ms) leaves 300ms for the pop, the app's resume and its window event to all land — on precisely the slow devices that reported #26. Past that the block re-armed, and counted. |
+
+Fixing those four leaves the structure that guarantees a fifth. So the fix is an invariant over the OUTCOME, and the four mechanisms are fixed underneath it:
+
+> **A `wasBlocked` row for target T may be written only if, since the previous row for that same confrontation, the foreground genuinely left T.**
+
+- **The state lives in `BlockLaunchGuard`** (which already owns foreground, walk-away and pending-overlay) and **the decision is pure in `BlockLaunchGate`** (`Arrival`, `confrontationKey`, `isNewConfrontation`, `arrivalAfterConfrontation`, `arrivalAfterSignal`), so the whole matrix is a JVM test instead of a device session.
+- **A departure is**: `ForegroundSignal.Home`; a different app's `AppWindow`; Nudge's own MAIN app window; a screen-off. It is **not** our own block overlay, the notification shade, a keyboard, a framework popup, a PiP bubble, or nothing at all. The first two come off the classified signal. The other two cannot: a screen-off is a broadcast and never enters the accessibility stream, and *every* Nudge window is `OwnUi` — the block overlay, the Strict Mode guard, the PiP explainer, and the overlay TASK's first window, which arrives ~600ms early carrying the framework class `android.widget.FrameLayout`. Letting `OwnUi` end an arrival would mean the overlay's own appearance re-opened the arrival it belongs to, which is the loop itself. So both are reported explicitly through `BlockLaunchGuard.onDeparture`, and the "is this Nudge's own app?" question is asked **positively, by exact class** (`isOwnMainAppWindowEvent`), never as "Nudge and not the overlay".
+- **A confrontation's identity is what the user ran into**, not who was blocked from re-entry: attributed package + feature key + web domain (`confrontationKey`). That is why a second blocked site in one Chrome sitting counts again (the domain changed) while sitting on one blocked site counts once, and why a Reels block after a completed whole-app block is its own entry.
+- **The ceiling is a hard cap, not an eviction policy.** `MAX_COUNTED_CONFRONTATIONS_PER_ARRIVAL = 32` refuses further new keys inside one arrival. Remembering only the last N keys would bound what we store and leave the rows unbounded — an evicted key looks new again next time round — which is a tidier data structure and the same bug. The cap is what makes the count unable to explode under a mechanism nobody has thought of yet.
+- **ENFORCEMENT IS NOT TOUCHED.** The claim sits in `handleDecision` *after* `launchBlockOverlay` and *after* grayscale, and refuses only the row. Someone still sitting in a blocked app should go on meeting the block; what must not go on is the number rising for a confrontation they never walked into. `BlockOverlayLaunchContractTest` pins that ordering at source level, because it is invisible in any value.
+- **The loop still says so, once.** The invariant makes the count safe whatever fires, and therefore makes the mechanism invisible — the symptom that used to arrive as "2500 interventions" now arrives as nothing at all. `launchBlockOverlay` counts ATTEMPTS (not launches: a run the gate keeps dropping writes no rows and is exactly where the next loop would hide) and logs ONE `w`-level `block overlay launch storm` line per storm, naming the target, the attempt count, the decisions seen, the foreground and the pending-overlay state. One line, not one per event: a loop firing every second would otherwise push the surrounding evidence out of logcat.
+
+### The pending overlay is a claim about a BLOCK, not about a package ([#50](https://github.com/astraedus/nudge/issues/50))
+
+The second mechanism in that table has a twin, and it is the one that reaches the user. `PendingOverlay` was the answer to "is an overlay for this package still on its way to the screen", and `Decision.DROP_ALREADY_PENDING` read it as "so this launch is a duplicate". Those are the same sentence only while the pending record describes the block the new launch would show.
+
+1.17.3 device QA: a Keep rule whose daily limit was already exceeded shows the **"Daily limit reached"** hard block; the user taps "Go Back", raises the limit in Nudge, cold-launches Keep — and meets **the same stale screen**, while logcat shows the fresh evaluation computing a non-blocking `DELAY` with 17 minutes remaining and the launch refused as `DROP_ALREADY_PENDING`. A further Home → relaunch showed the correct 5s delay, which is the settle window expiring rather than anything working.
+
+The ordering that produces it is this table's own second row wearing a different hat: the daily-limit clock launches at an instance that is **already RESUMED**, so the delivery arrives through `onNewIntent`, `onResume` never runs again, nothing can report the overlay shown, and the record sits at `windowShown = false` for the full `OVERLAY_SETTLE_MS` under an activity the user is looking at.
+
+`PendingOverlay` now carries a `decisionKey` (`BlockLaunchGate.decisionFingerprint`: the confrontation's identity, plus the block mode, plus whether it is the daily-limit variant), and a launch is a duplicate only while the fingerprint matches. Nothing that TICKS is in it — a countdown in a fingerprint would make every re-launch look new and hand this table's whole problem back. A re-delivery keeps the on-screen overlay's id and `windowShown` and adopts the NEW fingerprint, because that is the block it is about to render. Full reasoning, the two rejected alternatives (a rule-change flow, the record's age), and the test list: `foreground-detection.md`, *"Already pending" has to mean the SAME BLOCK*.
+
+Tests: `InterventionCountReplayTest` (every mechanism above replayed through the real classifier, guard and gate, each asserting ROWS — with the launch count on the same run as the counterfactual, since one row per allowed launch is literally what the old code did; plus the arrival matrix over every departure kind × every block kind, and the dated 100-iteration regression), `ArrivalAndStormGateTest` (the pure functions, branch by branch), `BlockOverlayLaunchContractTest` (the claim's position, the single row writer, the two reported departures, the storm log, the fail-safe re-arm).
+
+## Daily 2-minute pass (emergency escape hatch) — v1.9.0, made GLOBAL + 2min in v1.9.2
+
+Opt-in escape hatch on the block overlays. **ONE 2-minute free window per rolling 24h across the WHOLE device** (v1.9.2 — was per-app, 1 minute). Using it on any app grants that app a 2-minute window AND locks the pass out for *every* app for 24h. Availability is governed **solely by its own Settings master toggle** — Strict Mode does NOT hide it (changed in v1.10.0; see "Strict Mode vs. the escape hatch" below).
+
+- **`domain/emergency/EmergencyPass.kt`** — pure Kotlin. Ledger `parse`/`serialize` (format `pkg=epochMillis;…`, fails soft to empty map on malformed input, never throws) kept for **migration**: `globalLastUsed(usage)` takes the MAX timestamp across ALL entries, so a legacy per-app ledger is reinterpreted as one global last-used. `canUseGlobal(usage, now, cooldownMs)`, `nextAvailableGlobalMs(...)` (remaining lockout for the UI hint), `recordGlobal(now)` (collapses the ledger to a single `GLOBAL_KEY="*"` entry). Constants `PASS_DURATION_MS=120_000`, `LOCKOUT_MS=86_400_000`. Fully unit-tested (`EmergencyPassTest`, 22 cases incl. cross-app lockout + migration).
+- **`service/EmergencyPassManager.kt`** (`@Singleton`) — modeled on `PassthroughManager`. In-memory `activeUntil: ConcurrentHashMap<pkg, Long>` — the active window stays **per-app** (pressing the pass on Instagram unblocks Instagram, not everything); only the lockout is global. Per-package `kickJobs` so a fresh grant replaces the prior timer. `isPassActive(pkg)` is the non-blocking hot-path check. `usePass(pkg)` opens the window, persists the global lockout (`prefs.recordEmergencyPassUsed(now)`), and schedules `delay(PASS_DURATION_MS) → remove → kickHome()` **only if `isGlobalEnabled`** (a scheduled kick must not fire while Nudge is globally disabled). `cancelAll()` cancels every window + pending kick (called on global-disable). `kickHome()` prefers `NudgeAccessibilityService.requestGoHome()` and falls back to a HOME intent. The active window is in-memory only — a restart ends the window (fail-safe toward re-blocking); only the lockout is persisted.
+- **Prefs** (`NudgePreferences`): `emergencyPassEnabled` (bool, default **true**) + `emergencyPassUsage` (serialized ledger string) + `recordEmergencyPassUsed(now)` (overwrites the ledger with the single global entry — the lockout is global, no per-app merge).
+- **Service integration** (`NudgeAccessibilityService`): `emergencyPassManager()` on the EntryPoint; in `evaluateForegroundPackage`, `if (isPassActive(pkg)) return` placed **before** the auto-kick-cooldown block so an active pass overrides cooldown too. When the window expires the scheduled kick sends the user home AND the next foreground event re-blocks normally (backstop).
+- **UI**: `ui/overlay/EmergencyPassAction.kt` — the pure resolver **plus** one shared composable rendered by every overlay below the primary button: muted `TextButton` "Use for 2 minutes · once a day" when available; a **disabled/greyed** `TextButton` "Daily pass used · next in Xh" when spent (visible, not hidden); nothing otherwise. `internal fun resolveEmergencyPassState(packageName, passEnabled, usage, now, lockoutMs)` → `EmergencyPassUiState(canUse, locked, nextPassMs)` owns the **entire** decision (pseudo-package skip → toggle → `canUseGlobal`/`nextAvailableGlobalMs`); it is pure so it is JVM-tested (`EmergencyPassVisibilityTest`) instead of buried in the Activity. `BlockOverlayActivity` just calls it inside the existing `runBlocking` alongside the message pools (correct on first composition, no flash) and forwards the three fields. Rendered on ALL `BlockOverlayActivity` launch paths — rule blocks (`handleDecision`), auto-kick cooldown DELAY (`evaluateForegroundPackage`), and daily-limit HARD_BLOCK (`TimeRemainingHandler`) — since all set a real package and go through `render()`. Tap → `emergencyPassManager.usePass(pkg); finish()`. Settings master toggle under "Escape Hatch" (live under Strict Mode; enabling it is challenge-gated).
+- **Strict Mode vs. the escape hatch (v1.10.0)** — Strict Mode used to hide the pass on overlays and freeze/grey the Settings toggle. That silently revoked an escape hatch the user had deliberately opted into, so the lock now bites where protection is actually WEAKENED instead: **`resolveEmergencyPassState` takes no strict-mode flag at all** (a regression would have to add the parameter back), and turning the toggle OFF→ON while Strict Mode is on requires the typed unlock challenge. Turning it ON→OFF strengthens protection and is always free. Policy lives in `domain/lock/SettingsWeakening.requiresUnlock(toggle, enable, strictModeEnabled)` with `LockedToggle` = { STRICT_MODE, EMERGENCY_PASS } — the Settings-screen sibling of `RuleWeakening`.
+- **Device-verified**: v1.9.0 (per-app 1min); v1.9.2 (global 2min button text, cross-app greyed lockout). v1.10.0 semantics change is unit-tested; device QA pending.
+
+## HOLD, a block mode whose timer only runs under your thumb ([#35](https://github.com/astraedus/nudge/issues/35), v1.17.3)
+
+> Read this before changing anything about how a timed block COMPLETES, or before adding a block mode.
+
+A user wrote in on 2026-09-18 and left the same request as a Play review the same week: make the
+unlock a press-and-hold. They cite Wall Habit. The owner agreed to this item and explicitly deferred
+the other two on the issue (per-app hold durations, uninstall protection).
+
+The first attempt (PR #45) built it as a short hold appended AFTER a DELAY or BREATHING timer, plus
+a global "Hold to unlock" setting. That was the wrong shape, and the owner said so: *"it's meant to
+be another option to do INSTEAD of the delay or breathing timer -- like instead of waiting 15
+seconds, you have to be holding a button or pressing the screen for 15 or however many seconds
+before you can use the app."* All of the bolt-on was removed; what survived is `HoldProgress`.
+
+**So HOLD is a peer of HARD_BLOCK / DELAY / BREATHING, not a step attached to one.** The reason it
+is worth a mode is not the gesture, it is what the gesture changes about the cost of entering.
+A `DELAY`'s entire price is *waiting*, and waiting is something a thumb can pay while the person is
+somewhere else entirely. A hold is the same seconds spent *choosing*, and **letting go is the cheap
+action** — the direction every affordance in this app should point.
+
+### Shape
+
+- **`domain/hold/HoldProgress.kt`**, pure Kotlin, no Android, no Compose. `press` / `release` /
+  `fraction` / `advance` / `reset`. `advance` returns true **exactly once** per completed hold and
+  is the only thing between a sustained press and two passthrough grants. A release before
+  completion abandons the attempt; a second `press` while already pressed RESTARTS from that moment,
+  which is what makes time spent off-screen worthless (the same rule the countdown follows, issue
+  #8). Unit-tested end to end in `HoldProgressTest`, because every interesting rule here is a rule
+  about a gesture, and a gesture needs a finger and a stopwatch to observe on a device.
+- **`ui/overlay/HoldTarget.kt`**, rendering and input only. It drives one `HoldProgress` from a
+  `withFrameMillis` loop inside `repeatOnLifecycle(RESUMED)` and calls its callback when `advance`
+  says the hold landed. One haptic tick at completion.
+- **`ui/overlay/HoldContent.kt`**, the overlay body. Structurally `DelayContent` with the countdown
+  swapped for the target: same app label and "X left today" line, same headline pool (including the
+  user's own custom delay titles), same "I changed my mind", same daily pass, same rule footer.
+  There is no ticker in it at all — the only thing that moves this block's time forward is a finger.
+- **The duration is the rule's own `delaySeconds`.** Same column, same meaning, same picker, so a
+  rule flipped between DELAY and HOLD keeps its length and there is no migration to regret. The
+  editors relabel the control "Hold Duration" when the live mode is HOLD; the seconds are not a
+  countdown the user watches, and calling them a delay reads as a second, separate wait.
+
+### The invariants, and why each one is pinned
+
+- **The hold IS the block's timer; it is never a second way in.** `HoldContent` passes its own
+  `onComplete` straight through as the target's `onHoldComplete`, so completion lands in
+  `onTimerComplete()` — which is lifecycle-gated, because a countdown that reached zero off-screen
+  was the issue #8 bypass. `HoldModeContractTest` asserts `passthroughManager.grant` has exactly ONE
+  call site in the activity, that all three timed overlays complete into `onTimerComplete`, and that
+  neither hold file can reach `PassthroughManager` or `finish()` at all. This is the assertion the
+  whole test file exists for: a press-and-hold that opens apps is one careless edit away from being
+  an unguarded second door. **`OverlayLifecycle` is untouched by this feature** — deliberately, and
+  its unchanged tests are the evidence.
+- **The hold only progresses while the overlay is on screen.** RESUMED-gated loop, and `press`
+  restarts on re-entry rather than resuming, so wall-clock time away can never count toward opening
+  an app. Issue #8, one layer further in.
+- **A re-delivered block starts from zero.** Nothing new was built for this: the machine is
+  `remember`ed inside the per-delivery `key(blockToken)` subtree the activity already mints in
+  `render()` (issue #15), so a block arriving through `onNewIntent` discards it with everything
+  else. Hooking into the same token is the point — a second freshness mechanism is a second thing
+  to forget.
+- **Walking away still works, and still costs nothing.** "I changed my mind" and the back gesture
+  are untouched and live throughout the hold; the button sits below the target. On a HOLD the user's
+  thumb is already on the screen, so the one affordance that must never get harder to reach is the
+  one that lets them stop.
+- **TalkBack can operate it.** A press-and-hold is invisible to a screen reader — TalkBack consumes
+  touch exploration, so the gesture detector never sees a finger. On a DELAY such a user could still
+  just wait; on a HOLD there is nothing else to do, so without a second path a blind user would be
+  looking at the one control on screen that opens their app and be unable to use it: a block with no
+  way through. The target publishes a semantic click action that starts the SAME hold on the SAME
+  machine for the SAME duration. The friction is the wait, not the finger, so nothing is given away.
+- **HOLD and DELAY are EQUAL strength to `RuleWeakening`.** At one duration they cost the same
+  wall-clock wait, and the hold additionally costs attention for all of it, so neither is the softer
+  one and switching between them is not an edit Strict Mode should stand in the way of. Ranking HOLD
+  lower would have meant the stricter of the two needed a challenge to select.
+
+### Adding a block mode after this one
+
+Four lists used to have to be edited by hand for a new mode, and every one of them failed SILENTLY:
+no crash, no failing assertion, just a mode shown to the user by its raw enum name, or filed under
+"Other" with no bar on the interventions chart, or given a duration picker that never appears. They
+are now derived or shared:
+
+- `BlockEngine` scans one ordered `TIMED_MODES_STRONGEST_FIRST` instead of a branch per mode.
+- `blockModeLabel` / `blockModeDescription` live in `ui/components/BlockModeLabels.kt` and are
+  exhaustive `when`s, so a new mode does not COMPILE until it has a name and a sentence.
+- `BlockMode.usesDuration` / `FeatureMode.usesDuration` replace `== DELAY || == BREATHING`, and
+  `FeatureMode.toBlockMode` / `fromBlockMode` replace four hand-written mapping `when`s.
+- `InsightsCalculator.KNOWN_MODES` derives from `BlockMode.entries`, and `InterventionsScreen`'s
+  `MODE_ORDER` derives from that.
+
+What cannot be derived — the per-screen label `when (mode: String)` blocks, which have an `else` —
+is pinned by `HoldModeContractTest`'s two enum-driven tests: every `BlockMode` entry must have a
+branch on every screen that labels modes, and must render a real overlay body rather than falling
+through to `Unit` beside `NONE`.
+
+**Device QA pending.** The gesture's rules are unit-tested and its wiring is pinned at source level;
+what no JVM test can see is whether the target reads as something you press, whether fifteen seconds
+of holding feels like friction or like a bug, and whether TalkBack announces it usefully on a real
+phone.

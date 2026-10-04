@@ -1,0 +1,618 @@
+# Service lifecycle and the protection watchdog
+
+Covers what keeps Nudge's enforcement alive, what notices when it dies, and how the user finds out.
+**Read before touching `NudgeMonitorService`, `BootReceiver`, `ProtectionWatchdogWorker`,
+`ProtectionCheck`, `ProtectionStatus`, `AccessibilityConnectionSignal`, `NudgeApp`, `MainActivity`,
+or the permission rows on the Settings screen.**
+
+## The defect this subsystem was built out of
+
+Our first Play review was 3 stars, *"It doesn't work sometimes"* (Redmi Note 14, Android 16), and
+[issue #23](https://github.com/astraedus/nudge/issues/23) reported the accessibility service dying
+overnight **with battery restrictions already disabled**. The 2026-09-06 resilience audit found the
+mechanism, and it needed no OEM involvement at all:
+
+- `NudgeMonitorService.start()` had **exactly one call site in the whole codebase**: `BootReceiver`,
+  on `BOOT_COMPLETED`. `MainActivity` never started it. The master toggle never started it.
+  Completing onboarding never started it. `stop()` had zero call sites.
+- The manifest declared **one** receiver action, `BOOT_COMPLETED`. There was no
+  `ACTION_MY_PACKAGE_REPLACED`.
+- **Nothing anywhere ever asked whether the app was still working.** No `WorkManager`, no
+  `AlarmManager`, no `JobScheduler` — zero hits across `app/src`.
+- The Settings screen read all three permissions with `remember { mutableStateOf(...) }`: one shot
+  at first composition, never again.
+
+So: Play auto-updates Nudge overnight → the in-place update makes Android disable the accessibility
+service → no foreground service is running to notice → nothing restarts either → and the Settings
+screen keeps displaying a green tick over a dead service. Blocking silently stops until the user
+reboots. Then it works. Then it stops again at the next update. We shipped six releases between
+19 and 31 August 2026, so our own release cadence was firing this at users.
+
+MIUI does not have to do anything exotic to produce that review. It only has to win a fight we
+never turned up to. What MIUI adds is frequency, plus a force-stop that defeats `START_STICKY`
+outright, plus (per the OEM research) revoking the accessibility grant *as a consequence of* killing
+the process — which is why it stays dead until the user re-toggles it by hand.
+
+## The three parts
+
+### 1. Real start paths for the foreground service
+
+`NudgeMonitorService` holds process priority. It does not monitor anything (the accessibility
+binding is what enforces), so its value is entirely in existing — and it now exists whenever
+monitoring should be live:
+
+| Moment | Where |
+|---|---|
+| App launch with monitoring on | `MainActivity.keepMonitorServiceInSync()` |
+| Master toggle switched on **or off** | same observer — the flag is the thing being watched |
+| Onboarding completing | same observer — it writes `onboardingComplete` without leaving the Activity |
+| Device reboot | `BootReceiver`, `ACTION_BOOT_COMPLETED` |
+| App update | `BootReceiver`, `ACTION_MY_PACKAGE_REPLACED` |
+| A dead service found by the watchdog | `ProtectionWatchdogWorker` |
+
+The first three are **one observer**, not three call sites, because all three are a change in the
+same pair of flags (`isGlobalEnabled && isOnboardingComplete`) while `MainActivity` is on screen.
+Gating on onboarding too means a first-run user is never shown an ongoing notification claiming
+Nudge is monitoring before they have granted it anything to monitor with.
+
+Two invariants, both pinned by `ServiceLifecycleContractTest`:
+
+- **The receiver guard is a membership test.** It used to be
+  `if (intent.action != Intent.ACTION_BOOT_COMPLETED) return`. An inequality against ONE action
+  means adding a second action to the manifest compiles, ships, and silently does nothing.
+- **`NudgeMonitorService.start()` returns a Boolean and swallows `IllegalStateException`.** Android
+  12+ forbids starting a foreground service from the background, and the watchdog does exactly
+  that. Nudge normally qualifies for the `SYSTEM_ALERT_WINDOW` exemption, but onboarding lets that
+  permission be skipped, and then `startForegroundService` throws
+  `ForegroundServiceStartNotAllowedException`. An uncaught throw in the one component whose job is
+  noticing failure would be its own silent death.
+
+**`start()` returns early when `isRunning` is already true** (v1.18.3). Its KDoc had said "starts
+the service if it is not already running" since the day it was written and nothing implemented it,
+so every caller re-entered `onStartCommand` — and `onStartCommand` has to call `startForeground`,
+which is a notification post. See *The notification is posted on change* below for why that
+mattered. This does not weaken the watchdog: `ProtectionCheck` only calls `start()` when the
+snapshot already says the service is dead, i.e. when `isRunning` is false.
+
+`NudgeMonitorService.isRunning` is a `@Volatile` static set in `onStartCommand` and cleared in
+`onDestroy`. A static is the *honest* signal here precisely because it dies with the process: the
+failure being watched for is the OS killing us, and a killed process comes back with it false.
+(`getRunningServices()` has been restricted since API 26; a heartbeat timestamp would be this flag
+with extra I/O.)
+
+### 2. The watchdog
+
+`ProtectionWatchdogWorker` is a `WorkManager` periodic worker on the 15-minute floor, enqueued
+`KEEP` from `NudgeApp.onCreate()` — the one callback that runs on **every** process start, so it
+re-arms itself after a boot, an update, and any kill WorkManager itself recovers from. `KEEP` and
+not `REPLACE`: replacing the request on every launch would push the next run 15 minutes out each
+time, so the user who opens Nudge most would be checked least.
+
+**Not `AlarmManager`.** An exact alarm needs `SCHEDULE_EXACT_ALARM` (a Play-review surface) and is
+rate-limited on Android 14+, for a check whose tolerance is a quarter of an hour.
+
+The signal is **two reads, not one** (`ProtectionStatus`). Membership in
+`Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES` is the user's INTENT; membership in the system's
+bound list (`AccessibilityManager.getEnabledAccessibilityServiceList`) is REALITY, and the gap
+between them is the failure. Verified against AOSP master: when an accessibility service's process
+is killed, `binderDied()` puts the component in `mCrashedServices`, `updateServicesLocked()`
+`continue`s past it forever, and it is left in the settings string. A watchdog built on that string
+alone would sit reading "enabled, all good" through the entire failure it was written to catch. Only
+a force-stop or a user toggle strips the component.
+
+Between them the two reads still cover every root cause (a memory kill, MIUI's revoke-on-kill, an
+update-disable, a user switching it off), so no OEM-specific detection code is needed, only
+OEM-specific *messaging* later.
+
+The check body lives in `ProtectionCheck`, not in the worker, because **WorkManager cannot be made
+to run the worker on demand** (see "How to test this" below). The worker is the schedule,
+`ProtectionCheck` is the check, `ProtectionWatchdog` is the policy.
+
+The policy lives in `domain/health/ProtectionWatchdog`, a **pure function**, because the failure it
+exists for (a phone quietly switching Nudge off overnight) is not reproducible on a device.
+`ProtectionCheck` gathers the values and carries out the verdict; it holds no policy of its own, and
+`ServiceLifecycleContractTest` asserts it does not grow one.
+
+| State | What happens |
+|---|---|
+| Master toggle off | Silence, and any stale alert is dismissed. **Never nag a user who opted out.** |
+| Everything alive | Silence, alert dismissed |
+| Accessibility disabled (not in the settings string) | Notify on the **first** sighting — we cannot re-grant it, so waiting a cycle buys nothing and costs 15 more minutes of unblocked scrolling |
+| Accessibility granted but not bound | Notify on the **second consecutive** sighting, with its own copy ("turn it off and back on"). One confirming cycle separates a genuinely crashed service from one legitimately mid-bind: `mBindingServices` is not `mBoundServices`, so a check landing seconds after a boot or an update sees the same thing |
+| Foreground service dead, accessibility alive | **Restart it silently.** Blocking still works, so "protection has stopped" would be a lie |
+| Foreground service still dead next cycle | Notify — the restart did not hold, which is a phone actively shutting Nudge down, and that the user *can* act on |
+| Foreground service dead and the platform **refused** the restart | Silent on the first sighting, then `MONITOR_START_BLOCKED` — see *A refused start is a fault of its own* below. It supersedes the row above on the cycle where both are true, because it names a fix the user can perform |
+
+A **12-hour cooldown** sits over both alerts. A phone that keeps killing us would otherwise produce
+an alert every 15 minutes for as long as it stays broken, and a notification the user learns to
+swipe away is worth less than no notification at all. A clock moved backwards resets the cooldown
+rather than muting until wall-clock catches up.
+
+It has to be a **push notification, not an in-app banner.** An app blocker's whole point is to be
+invisible until it is needed, so the user has no organic reason to open Nudge — a banner would have
+left issue #23's reporter blind all night and into the next day. `POST_NOTIFICATIONS` was already
+declared but had never been *requested*: it is a runtime grant from Android 13, so without the
+request in `MainActivity` both this alert and the ongoing monitor notification are dropped on the
+floor on exactly the modern devices this protects. The alert uses its own channel, so muting the
+permanent silent one does not mute this.
+
+Tapping it lands in Nudge's own Settings screen, **not** straight in the system accessibility list:
+that screen carries the Play-mandated prominent-disclosure dialog, and this app has been rejected
+once on that gate already (`docs/play-store.md`).
+
+### 3. Settings shows live truth
+
+The permission rows track reality through three refresh paths, because the accessibility answer has
+two halves that change at different moments and the other two permissions have no watchable key at
+all:
+
+1. A `ContentObserver` on `ProtectionStatus.ACCESSIBILITY_SERVICES_URI`, which fires the instant the
+   enabled-services setting changes (a user toggle, a force-stop) even while this screen is on top.
+2. `AccessibilityConnectionSignal`, raised from the accessibility service's own `onServiceConnected`
+   and `onDestroy`.
+3. An `ON_RESUME` recheck of all three permissions, the only path available to overlay and
+   usage-stats, which are `AppOpsManager` modes with nothing to observe.
+
+**Why (2) exists.** The settings string is written when the toggle flips; the system binds the
+service *afterwards*, asynchronously (`updateServicesLocked` then `bindServiceAsUser`, the component
+sitting in `mBindingServices` until `onServiceConnected` lands). So the observer in (1) fires during
+that gap and reads granted-but-not-connected, which is byte-for-byte the crashed state. That is a
+momentary wrong tick only if something reads again, and while the screen stays resumed, nothing did:
+`ON_RESUME` never fires for a re-enable from a split window, from `adb shell settings put`, or from
+a quick-settings tile. The stale reading **latched**, and device QA watched the red cross and the
+"turn it off and back on" copy sit there for 20+ seconds over a service `dumpsys accessibility` had
+shown bound within 3. It would not have healed on its own.
+
+The fix is the event, not a timer. `onServiceConnected` IS the bind completing: the earliest correct
+moment to look again, no interval to tune, no wakeups when nothing is happening. The signal only
+says "look again" - the answer still comes from `ProtectionStatus`, which asks the framework. (A
+static flag would be the mistake `NudgeMonitorService.isRunning` is documented as deliberately not
+making for the watchdog. It is usable here only because the UI asks a different question, "has
+something changed", of a process that is by definition alive to ask it.)
+
+`LivePermissionStateContractTest` pins all of it, because a one-shot read is a defect in *where* the
+code is, not in any value a JVM test can inspect.
+
+The screen also no longer rolls its own accessibility read. It used to ask
+`enabledServices.contains(context.packageName)` — a substring test that says yes for any component
+of ours and for any package whose name merely contains ours. Both it and the watchdog now go
+through `ProtectionStatus`, so they cannot disagree. Note the two package names in play:
+`applicationId` is `dev.astraedus.nudge` and `namespace` is `com.astraedus.nudge`, so any matcher
+assuming the class is a child of the package is wrong here.
+
+## How to test this
+
+The watchdog's detection half is verifiable by hand; its **notification half was not**, and shipped
+once without ever having been seen to fire. `adb shell cmd jobscheduler run -f dev.astraedus.nudge
+<jobId>` prints "Running job [FORCED]" and a `jobFinished` about 12ms later, but `doWork()` never
+executes: no `WM-WorkerWrapper: Worker result` line is ever emitted (reproduced three times on the
+Pixel 3). WorkManager will not run a periodic worker early. So the only way to watch the alert was
+to be holding the phone through two consecutive natural cycles while the accessibility service
+happened to be dead, and the one divergence device QA managed to reproduce self-healed first.
+
+Hence `WatchdogDebugReceiver`: a **debug-build-only** broadcast that runs one check synchronously.
+It calls `ProtectionCheck.run` and nothing else, so it exercises the exact code the 15-minute
+schedule runs. It lives in `app/src/debug/`, class and manifest entry both, so it does not exist in
+a release APK at all; `WatchdogDebugTriggerContractTest` fails if either half leaks into `src/main`,
+or if the receiver ever grows a signal read or a decision of its own.
+
+### Running one check
+
+```bash
+adb shell am broadcast \
+  -a dev.astraedus.nudge.debug.RUN_WATCHDOG \
+  -n dev.astraedus.nudge/com.astraedus.nudge.service.WatchdogDebugReceiver
+```
+
+The explicit `-n` component is required, not decoration: a custom action is an *implicit* broadcast,
+and manifest-declared receivers have not received those since API 26. Note the two package names
+(`applicationId` is `dev.astraedus.nudge`, `namespace` is `com.astraedus.nudge`) - the component is
+one of each.
+
+The verdict comes back in the broadcast result, so you read the DECISION rather than inferring it
+from whether a notification appeared:
+
+```
+Broadcast completed: result=0, data="global=true granted=true connected=false monitorRunning=true
+wasDegraded=true | notify=ACCESSIBILITY_CRASHED dismiss=false startService=false degradedNow=true
+reported=ACCESSIBILITY_CRASHED"
+```
+
+Same line on logcat under tag `ProtectionWatchdog`.
+
+**`notify=` and `reported=` are different fields and the difference is the point.** `notify=` is
+what `ProtectionWatchdog.decide` concluded from the snapshot alone; `reported=` is what the user
+was actually told, after the foreground-service start was attempted and possibly refused (#62,
+below). They agree on every cycle where nothing was refused. When they disagree, a
+` (service start REFUSED by platform)` suffix is appended and `reported=` is the field that
+matches the notification in the shade.
+
+Two extras stage persisted inputs that a real earlier cycle would have written. They are fixtures,
+not a second code path - both go through the same `recordProtectionCheck` the check itself uses:
+
+| Extra | Effect |
+|---|---|
+| `--ez reset true` | Clears the degraded flag and the 12-hour alert cooldown. Without it, a state can only be re-tested twice a day. |
+| `--ez degraded true` | Marks the previous check as degraded, satisfying the confirming-cycle rule in one broadcast. Sending the broadcast twice is more faithful and is preferred; this is for a fault that is only briefly reproducible. |
+
+### Forcing each state
+
+The master toggle is Nudge's own switch on the Home screen. `X` below is the accessibility component
+`dev.astraedus.nudge/com.astraedus.nudge.service.NudgeAccessibilityService`.
+
+| State | How to force it | Expected verdict |
+|---|---|---|
+| **Healthy** | Master toggle on, accessibility on. Confirm with `adb shell dumpsys accessibility \| grep -E "Enabled services\|Bound services"` - our component must be in BOTH. | `notify=none dismiss=true degradedNow=false` |
+| **Monitoring off** | Master toggle off in the app. | `global=false notify=none dismiss=true` - never nag a user who opted out. |
+| **Granted but not connected** (`ACCESSIBILITY_CRASHED`) | `adb shell am crash dev.astraedus.nudge` produces the state, but on an idle device it heals in 150ms-3s - see "What could NOT be verified" below before spending time here. Confirm with `adb shell dumpsys accessibility \| grep -E "Enabled services\|Bound services\|Crashed services"`: ours under Enabled, absent from Bound. | First broadcast: `connected=false notify=none degradedNow=true`. **Second**: `notify=ACCESSIBILITY_CRASHED`. Unverified on device to date. |
+| **User-disabled** (`ACCESSIBILITY_DISABLED`) | Turn the toggle off in system Settings, or `adb shell settings put secure enabled_accessibility_services ""` - **record the old value first** (`settings get secure enabled_accessibility_services`), that key holds every service on the device, not just ours. | `granted=false notify=ACCESSIBILITY_DISABLED` on the FIRST broadcast - we cannot re-grant it, so waiting a cycle only costs the user 15 more minutes. |
+| **Foreground service dead** (`MONITOR_SERVICE_DEAD`) | Same `am crash`; `NudgeMonitorService.isRunning` is a static, so it comes back false in the new process. Reachable only with accessibility healthy, since the fault order is granted, then connected, then service. | First: `startService=true`. Second, if the restart did not hold: `notify=MONITOR_SERVICE_DEAD`. |
+
+A fresh run of a two-cycle state is therefore: broadcast with `--ez reset true`, then broadcast plain.
+
+### Three ways the broadcast returns no verdict (none of them mean the trigger is broken)
+
+Device QA hit all three. `result=0` with **no `data=`** is the shared symptom, and it looks exactly
+like the receiver not existing, so check these before concluding the trigger is dead:
+
+1. **Two `am crash`es on the same process within ~90 seconds poisons broadcast delivery to it for
+   minutes.** AMS logs `BroadcastQueue: Timeout of broadcast` and `Crashing app skipping ANR`, the
+   broadcast hangs for the full 60s timeout, and no result data comes back. It persists after the
+   accessibility service itself has healed, so it is an AMS-level state about the process, not
+   anything to do with this check. Only `am force-stop` plus a relaunch clears it. **Discipline: one
+   `am crash` per force-stop/relaunch cycle.**
+2. **Broadcasting at t+0 after a crash** can reach a receiver that runs before the process is ready
+   to complete it, and no result data is set.
+3. Genuinely not installed: `adb shell dumpsys package dev.astraedus.nudge | grep -A5
+   WatchdogDebugReceiver` shows nothing. That is the real failure, and it means a release build.
+
+### What could NOT be verified on the bench, and why
+
+`ACCESSIBILITY_CRASHED` has never been observed firing on a device, after eight attempts across
+several fault-injection strategies. Not because the logic is wrong: **on an idle Pixel 3 the
+accessibility service rebinds in 150ms to 3s after `am crash`, and `Crashed services` empties with
+it, faster than an `am broadcast` round trip.** QA could prove the granted-but-unbound state exists
+(repeatedly, via `dumpsys accessibility`) and could prove the posting pipeline works (the sibling
+`ACCESSIBILITY_DISABLED` and `MONITOR_SERVICE_DEAD` faults both posted real notifications on
+`nudge_protection_alerts` through the identical `notify()` body), but never got the two to coincide.
+Even a 50ms on-device poll that fired the broadcast the instant `dumpsys` showed `Bound services:{}`
+had the service back by the time the receiver evaluated.
+
+**Do not "fix" this with a fake fault or a QA hold that bypasses the check.** A trigger that runs
+different code than production is the failure mode this whole file exists to avoid. What this
+observation actually tells us is more useful than a green tick would have been:
+
+- The 10+ minute stuck-unbound state a previous QA run recorded is real, but it is NOT what `am
+  crash` on an idle device produces. The field cause is a low-memory kill or an OEM force-stop with
+  the screen off, where nothing is trying to restart us. That is not reproducible on the bench.
+- **The two-strike rule on this fault is therefore load-bearing, not a formality.** It is what stops
+  us alerting on a crash the system heals within seconds. If it were removed, this device would post
+  a false "your phone broke Nudge" on every transient.
+- Because the state self-heals so readily, `ACCESSIBILITY_CRASHED` should be rare in the field. That
+  is the design working, not the alert failing.
+
+The residual risk is the copy, not the delivery: a crashed user's switch already reads ON, so being
+told the permission is off would send them nowhere. `ProtectionAlertCopyTest` pins the fault-to-copy
+mapping over the whole `ProtectionFault` enum, so a new fault cannot ship without copy and the
+crashed message cannot drift into the grant prompt.
+
+### Asserting the notification
+
+```bash
+adb shell dumpsys notification --noredact | grep -B2 -A12 nudge_protection_alerts
+```
+
+What to check:
+
+- **Posted**: a record with `pkg=dev.astraedus.nudge`, `id=2`, `channel=nudge_protection_alerts`.
+  Id 1 is the permanent monitor notification and is not this. The channel is separate on purpose:
+  a user who mutes the silent ongoing one must not thereby mute this.
+- **Copy matches the fault**: `ACCESSIBILITY_CRASHED` says turn it off and back on, and must NEVER
+  show the "grant the permission" copy - that user's switch already reads on, and telling them to
+  turn on what is already on is how a safety notification gets muted.
+- **Not posted**: no such record. Nothing about a healthy check or a disabled master toggle may
+  produce one.
+- **Dismissed**: run a healthy check while an alert is showing; the record disappears (the decision
+  line will read `dismiss=true`).
+
+If a check returns `notify=<FAULT>` and no record appears, the decision is fine and the POST is
+being dropped - check `POST_NOTIFICATIONS` (`adb shell dumpsys package dev.astraedus.nudge | grep
+POST_NOTIFICATIONS`). That distinction is exactly why the verdict is returned in the broadcast
+result and not inferred from the shade.
+
+## A refused start is a fault of its own ([#62](https://github.com/astraedus/nudge/issues/62), v1.18.3)
+
+The bench Pixel 3's dropbox held `system_server_wtf` entries for a **denied foreground-service
+background start** of `NudgeMonitorService`. Not a crash, and not new: `start()` has always caught
+`ForegroundServiceStartNotAllowedException` and returned `false`. The gap was everything after
+that. `ProtectionCheck` logged it at w-level and carried on, so on a phone where the start is
+always refused the watchdog could never heal the service, and **nothing told the user** that the
+one component whose job is noticing failure was itself missing an arm.
+
+### Which exemptions we actually have
+
+Verified against the platform's own list (*Foreground service launch restrictions*, API 31+):
+
+| Path | Exempt? |
+|---|---|
+| `MainActivity` visible / recently foreground | **Yes** |
+| `BOOT_COMPLETED`, `LOCKED_BOOT_COMPLETED`, `MY_PACKAGE_REPLACED` | **Yes** — so `BootReceiver` is fine |
+| User interacting with our notification or widget | **Yes** |
+| `SYSTEM_ALERT_WINDOW` granted | **Yes**, but see below |
+| Battery optimization turned off for us | Yes — but we deliberately do not ask (Play-policy risk, *Deliberately NOT built here*) |
+| A **bound AccessibilityService** | **No.** Do not "fix" a refusal by starting the service from `onServiceConnected`; that is a second silently refused path |
+| A WorkManager **expedited** job | **No.** Promoting the watchdog worker would change nothing |
+
+So `SYSTEM_ALERT_WINDOW` is the only exemption the watchdog has ever run under, and onboarding
+lets that permission be skipped. **Android 16 narrows it further, to apps with a currently VISIBLE
+overlay window** — holding the grant stops being sufficient there. This fault is therefore on its
+way from "a misconfigured minority" to "the ordinary case", which is the argument for surfacing it
+rather than logging it. There is **no API to ask in advance** whether a start would be allowed:
+attempt and catch is the only available shape.
+
+### Where the decision lives
+
+`decide()` cannot answer this, because whether a start will be refused is only knowable once one
+has been attempted. So there is a **second pure step**, `ProtectionWatchdog.faultToReport(snapshot,
+decision, startRefused)`, and `ProtectionCheck` calls it after the attempt and posts from its
+result instead of from `decision.notifyOf`. Putting an `if (refused) notify(...)` in
+`ProtectionCheck` instead would have duplicated the confirming-cycle and cooldown rules into the
+one place no unit test can reach — the invariant `ServiceLifecycleContractTest` already pins.
+
+Its rules, and why each exists:
+
+- **Nothing refused: return `decision.notifyOf` unchanged.** This function is on the path of every
+  check, so the common case has to be byte-identical to the behaviour that shipped before it.
+- **Master toggle off: silence.** A refusal must not become a back door around *never nag a user
+  who opted out*.
+- **An accessibility fault outranks it.** `ACCESSIBILITY_DISABLED` / `ACCESSIBILITY_CRASHED` mean
+  blocking is ACTUALLY dead, which is worse, and their recoveries bring the service back anyway.
+- **One confirming cycle**, exactly as `MONITOR_SERVICE_DEAD` has. `isRunning` is in-process only,
+  so the FIRST check after ANY process start reports the service dead and attempts a start;
+  alerting on that single sighting would fire on every boot and every update.
+- **The same 12-hour cooldown, and the same persisted timestamp.** A phone in this state refuses
+  every restart, so a second clock would drift out of step with the first and double the noise.
+  `ProtectionCheck` therefore advances the cooldown on the fault it POSTED, not on the verdict.
+
+### Two things heal it, and they are a designed pair
+
+`MainActivity` now retries the start on **every resume** when monitoring should be on and
+`NudgeMonitorService.isRunning` is false. The existing `keepMonitorServiceInSync()` observer could
+not do this: it is `distinctUntilChanged` over two flags, so opening the app with the flags
+unchanged emits nothing, and the user sat looking at an app whose service was dead. Gating the
+retry on `isRunning` matters too — an unconditional `sync()` per resume would re-post the ongoing
+notification, which is #63.
+
+Because the alert's tap target is `MainActivity`, **tapping the notification is itself a legal
+foreground moment and restarts the service**, on every API level, before the user does anything
+about the permission. Neither the tap destination nor the resume observer may be changed without
+the other.
+
+### The copy, and what it may not promise
+
+`protection_alert_blocked_title` / `_body`, stem `protection_alert_blocked`, pinned by
+`ProtectionAlertCopyTest` (which iterates the real enum, so the new fault could not ship without
+copy). It leads with *opening Nudge restarts it* — true on every version — and offers "Display over
+other apps" as what lets Nudge do it unattended. Neither sentence is a promise, because on Android
+16 the grant alone is not sufficient. The onboarding and Settings permission rows carry the same
+cost in the same honest shape, gated by `OverlayPermissionCopyTest`.
+
+### Reproducing it on the bench
+
+```bash
+adb shell appops set dev.astraedus.nudge SYSTEM_ALERT_WINDOW deny
+adb shell am force-stop dev.astraedus.nudge
+adb shell am broadcast -a dev.astraedus.nudge.debug.RUN_WATCHDOG \
+  -n dev.astraedus.nudge/com.astraedus.nudge.service.WatchdogDebugReceiver --ez reset true
+# first: startService=true, reported=none, "(service start REFUSED by platform)"
+adb shell am broadcast -a dev.astraedus.nudge.debug.RUN_WATCHDOG \
+  -n dev.astraedus.nudge/com.astraedus.nudge.service.WatchdogDebugReceiver
+# second: reported=MONITOR_START_BLOCKED, and a notification on nudge_protection_alerts
+```
+
+Then open Nudge: the resume retry starts the service, and
+`adb shell dumpsys activity services dev.astraedus.nudge | grep NudgeMonitorService` shows it
+running again. Restore with `appops set ... allow`.
+
+**That recipe does not work as written on the bench Pixel 3 (API 31), measured 2026-09-29** while
+scripting `refusal-alert` in `scripts/device-qa.sh`. Two facts fight each other:
+
+- **`am force-stop` does not merely unbind the accessibility service — it prunes our component out
+  of `enabled_accessibility_services`**, the same pruning `pm clear` triggers. So the very next
+  broadcast arrives with `granted=false`, and `faultToReport` correctly answers
+  `ACCESSIBILITY_DISABLED`, which **outranks** a refused start by design. Observed:
+  `cycle 1: granted=false … reported=ACCESSIBILITY_DISABLED (service start REFUSED by platform)`,
+  then `cycle 2: reported=none` because cycle 1 had already spent the 12-hour cooldown.
+- **Re-granting accessibility to get past that heals the service.** `onServiceConnected` starts the
+  monitor and on this device that start SUCCEEDS even with `SYSTEM_ALERT_WINDOW` denied — three
+  consecutive runs returned `granted=true connected=true monitorRunning=true … notify=none
+  dismiss=true`, i.e. perfectly healthy, with no refused start left to report. (Which is also a
+  caution about the exemption table above: whatever the documented rule, on API 31 the rebind path
+  got its foreground-service start through.)
+
+So the state this fault describes is **not reachable on the bench by this route** — the same honest
+dead end recorded for `ACCESSIBILITY_CRASHED` above, and the same rule applies: do NOT fake the
+fault or add a QA-only hold to force it. `scripts/device-qa.sh`'s `refusal-alert` therefore reports
+**SKIP with that reason** when the snapshot comes back healthy, and FAILs only when the state WAS
+reached and the verdict is still wrong. The alert itself stays pinned by `ProtectionAlertCopyTest`
+(iterates the real enum, so a fault cannot ship without copy) and `ServiceLifecycleContractTest`.
+If you want this covered on a device, the missing ingredient is a way to keep the monitor service
+dead while accessibility is alive — not a louder assertion.
+
+## The notification is posted on CHANGE, and health is re-evaluated on EVENTS ([#63](https://github.com/astraedus/nudge/issues/63), v1.18.3)
+
+A user on a Pixel 10 Pro / Android 17 read his own battery with BetterBatteryStats and sent us the
+measurement: over **10h24m**, `NotificationManagerService:post:dev.astraedus.nudge` had been taken
+**267 times** — about once every 2.3 minutes, all of it while the phone was trying to sleep — for
+2m49s of user time plus 1m49s of system time and repeated Deep Doze interruptions. He also reported
+the tell that named the mechanism outright: *swipe the permanent notification away and it is back
+within seconds, with no changing text.*
+
+There is no platform-side dedup to hide behind. `NotificationManagerService.enqueueNotification`
+takes its post wakelock before it has looked at the content, so a byte-identical re-post costs
+exactly what a real one costs. Nothing but the app can tell "nothing changed".
+
+**Three separate paths were posting, and all three are closed:**
+
+| Path | What it was | Fix |
+|---|---|---|
+| The health poll | `manager.notify(...)` every 30s, unconditionally — 1200+ a night | `StatusNotificationGate` holds the fingerprint of the copy on screen; `publishHealth` posts only when it differs |
+| Every redundant `start()` | `startForegroundService` re-runs `onStartCommand`, which must call `startForeground`, which is a post | `start()` returns early when `isRunning` |
+| `isGlobalEnabled` re-emitting | DataStore's `data` flow re-emits the whole snapshot on a write to **any** key; `NudgeAccessibilityService` collects it and calls `sync` on each emission — so `ProtectionCheck`'s own per-cycle write posted the notification | `distinctUntilChanged` on `isGlobalEnabled` and `isOnboardingComplete` in `NudgePreferences` |
+
+The third is the one worth remembering: a file with no clock in it was posting on a schedule,
+driven by a write in a different subsystem. Nothing may now depend on those two flows re-emitting
+an unchanged value — that was never a signal, only a side effect of which key someone else wrote.
+
+### Event first, timeout second
+
+`HEALTH_POLL_INTERVAL_MS` went from **30 seconds to 5 minutes**, and is now a backstop rather than
+the mechanism. The original justification here — "poll rather than observe: the system unbound our
+service fires no callback we can receive in a process that was not running at the time" — is true,
+and it is an argument for `ProtectionWatchdogWorker`, not for a timer inside a process that *is*
+running. In a live process the unbind DOES fire a callback: `AccessibilityConnectionSignal`, raised
+from the accessibility service's own `onServiceConnected` and `onDestroy` (the same signal the
+Settings screen already uses, part 3 above). The master toggle is a Flow. So the service now waits
+on `merge(connection signal, master toggle)` with `withTimeoutOrNull(HEALTH_POLL_INTERVAL_MS)`, and
+both sources are filtered against **what the last evaluation saw** rather than dropped by position —
+otherwise a change landing between finishing an evaluation and starting to listen again would be
+slept through for the whole interval.
+
+Two properties this relies on, both verified rather than assumed:
+
+- A `kotlinx.coroutines.delay` holds no wakelock and schedules no alarm. It does not wake a dozing
+  phone; it simply does not fire until the CPU is up for some other reason. The delay was never the
+  Doze breaker — the `notify()` inside each tick was.
+- Dismissal on Android 14+ does **not** stop a foreground service. `FLAG_ONGOING_EVENT` stopped
+  preventing swipe-dismiss in Android 14, so the user genuinely can clear this notification, and the
+  service keeps running and keeps enforcing.
+
+### The swipe is answered with silence, deliberately
+
+When a user dismisses the ongoing notification we do **not** re-post it. Blocking does not depend on
+it, the service is unaffected, and re-posting is precisely the every-few-seconds resurrection the
+bug report described. It returns on the next genuine state change — which is the only time it has
+anything new to say. The gate therefore has no `reset()`: there is nothing that should clear it.
+
+**Cost accepted:** alert latency on a fault that emits no event at all is now up to 5 minutes to the
+first sighting instead of 30 seconds. There is no known reachable fault of that shape — disabling
+the permission unbinds the service (an event), and a process kill takes this service with it (the
+worker's job) — and the confirming-cycle faults were always going to cost a second sighting anyway.
+
+### What the tests own
+
+- `StatusNotificationGateTest` (**L1 pure JVM**) counts POSTS, not internal branches: 121 unchanged
+  evaluations produce 1 post, and the **counterfactual** runs the pre-fix rule over the identical
+  sequence through the identical driver and produces 121. A state flip produces exactly 1, and 500
+  further identical evaluations after a dismissal produce 0.
+- `MonitorServiceContractTest` owns what no JVM test can see — that the service still *asks*: there
+  is exactly one `notify()` and it sits inside a `shouldPost()` branch, `onPosted` is recorded after
+  it and never before, `startForeground` has exactly one call site, `start()` early-returns on
+  `isRunning`, `isGlobalEnabled` is `distinctUntilChanged`, the connection signal is read, and the
+  backstop interval is minutes rather than seconds. Each of those was confirmed to FAIL with the
+  guard removed before being committed.
+
+### Measuring it on a device
+
+```bash
+adb shell dumpsys notification --noredact | grep -c 'pkg=dev.astraedus.nudge'
+```
+
+Take that count, leave the phone idle with the screen off for ten minutes, take it again. The
+delta must be **0** while nothing changes, and exactly **1** across a deliberate state flip (turn
+the accessibility service off, or the master toggle). Before this change the same window produced
+roughly twenty.
+
+## Known limits (deliberate, not oversights)
+
+- **Doze defers the check.** WorkManager periodic work runs in maintenance windows, so on a phone
+  in deep idle overnight the alert may arrive in the morning rather than at 2am. Still infinitely
+  better than never, and the alternative is an exact alarm with a Play-policy cost.
+- **A killed process is now fully detected, but only after one confirming cycle.** The
+  bound-services read sees it immediately; the confirming cycle is what separates a crashed service
+  from one legitimately mid-bind, and costs up to 15 minutes. (This bullet used to claim Android
+  re-binds a killed accessibility service and that the state was therefore only half-detectable.
+  AOSP does not: `mCrashedServices` is never retried. That retracted claim is why the two-read
+  design exists.) No official API distinguishes "OEM killed it" from "user turned it off", so the
+  fault copy is inferred from which of the two lists lost us.
+- **`isRunning` is in-process only.** That is the point (see above), but it means the first check
+  after any process restart always reports the service dead, which is why a dead service is
+  restarted silently and only notified about if it is *still* dead on the following run.
+
+## Deliberately NOT built here
+
+Each is a separate lane, and each has a real cost that has not been paid yet:
+
+- `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` — genuine Play-policy risk, and issue #23 is direct
+  evidence it would not have been sufficient anyway (that reporter had already disabled battery
+  restrictions).
+- Manufacturer-aware onboarding and autostart deep links (`com.miui.securitycenter`, Samsung's
+  "never sleeping apps", …).
+- The passthrough that survives screen-off, the background-activity-launch overlay fallback, the
+  untested `isOverlayActive`/content-change seam, and the local diagnostics log. All are in
+  `docs/BACKLOG.md` and in the resilience audit's fix order.
+
+## The service's coroutine scope cannot take the process down (audit F7, v1.17.3)
+
+Every block evaluation, every `UsageEvent` write and every DataStore collect in this app runs on
+`NudgeAccessibilityService.serviceScope`. It was a bare `CoroutineScope(SupervisorJob() +
+Dispatchers.IO)`, which is the half of the answer everyone remembers: the supervisor stops one
+failed child cancelling its siblings and does NOTHING about the exception itself. With no
+`CoroutineExceptionHandler` in the context, an unhandled throwable in a root coroutine reaches the
+thread's default uncaught-exception handler — and that kills the process, taking the
+accessibility service with it, which means blocking stops entirely until the system rebinds. One
+Room constraint violation is enough. Losing a stat row must never stop enforcement.
+
+The scope is now a `util/CrashSafeScope`, which is the pattern `RecordWalkAwayUseCase` already
+carried, extracted so it can be tested rather than eyeballed: the failure is logged at e-level with
+the coroutine's name and swallowed. `CrashSafeScopeTest` asserts the outcomes and carries the
+counterfactual that makes them mean something — the same throwing coroutine on a bare
+`SupervisorJob` scope DOES reach the default uncaught handler, and on this one never does.
+
+## Teardown cannot take the service down either ([#57](https://github.com/astraedus/nudge/issues/57), v1.18.2)
+
+The sibling of F7 above, one callback later, and worse. `foregroundClock` is a `lateinit` that only
+`onServiceConnected` assigns; `onDestroy` called `stopForegroundTimeTicker` unconditionally, and that
+read it. So any teardown of a service that never completed a connect threw
+`UninitializedPropertyAccessException` out of `onDestroy`, Android wrapped it as **"Unable to stop
+service"**, and the component landed in `mCrashedServices` — which, per the retraction in *Known
+limits* above, is **never retried**. Every rule became a silent no-op with nothing shown to the user.
+The bench Pixel's dropbox held four of these traces, three on 1.18.1 and one on 1.18.0, so this had
+been shipping for at least two releases. It was found while QAing #54 and presented as "the block
+screen just did not appear", which cost several rounds chasing a phantom regression in unrelated code.
+
+It is reachable from install-over / `MY_PACKAGE_REPLACED`, a force stop, a memory-pressure kill and
+rebind (BACKLOG F8 records this service churning on the bench device under exactly that), or a user
+toggling the permission quickly.
+
+Two layers of fix, because the field guard alone only fixes the field:
+
+- **Every `lateinit` teardown can reach is guarded**, the shape `hideAllOverlays` already used. There
+  were **two**, not one: `endWebSession` reads `webClock.isRunning` even when `activeWebSessionKey`
+  is already null, so it would have thrown in the same place the moment the clock above it was fixed.
+- **`onDestroy` runs every statement through `ServiceTeardown`**, which contains and reports each
+  step's failure by name. A throw in teardown can buy nothing — nothing after it can observe a
+  failure — and it was costing both the crashed-service state and the steps *below* the throw:
+  before this, the uninitialised clock on the third line meant `serviceScope` was never cancelled and
+  all three overlay managers kept a dead service as their context. `Throwable`, not `Exception`: a
+  `NoSuchMethodError` from an API-level mistake leaves the service equally crashed.
+
+Ordering is the only thing left to get wrong, so the two load-bearing ones are pinned: the instance
+is cleared **first** (anything reading connection state during the rest of teardown gets the truth)
+and the scope is cancelled **last**.
+
+`ServiceTeardownTest` owns the behaviour (a step throwing `UninitializedPropertyAccessException` does
+not escape, and the steps after it still run). `ServiceTeardownContractTest` owns the invariant and
+**discovers** it rather than listing it — it parses the service, computes which functions `onDestroy`
+can actually reach, and requires a guard for every `lateinit` any of them touches, plus that
+`onDestroy` holds nothing but contained steps. A new field, or a new call added to `onDestroy`, is
+covered the day it is written. Both carry counterfactuals: removing either guard fails them.
+
+**The watchdog already noticed this state, and that was checked rather than assumed.**
+`ProtectionStatus.isAccessibilityServiceConnected` reads
+`AccessibilityManager.getEnabledAccessibilityServiceList` — the server-side bound list, which a
+crashed service is absent from — so `ProtectionCheck` raises the "blocking has stopped" alert on its
+next cycle. The settings string, which survives a crash, is only ever read as *intent*. That is the
+design the retraction in *Known limits* produced, and this bug is the first real-world case it was
+built for. (`NudgeAccessibilityService.isConnected()`, the `instance != null` reading, has no
+production callers — nothing user-facing hangs off it.)

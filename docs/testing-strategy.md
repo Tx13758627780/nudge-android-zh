@@ -1,0 +1,446 @@
+# Testing strategy — which layer catches which bug
+
+`docs/TESTING.md` says what a change owes in tests. This says **where that test goes**, and it is the
+doc to read when a bug has just shipped. Source: the 2026-09-21 evaluation of the suite against the
+last 18 defects (`~/ops/routes/nudge/research/test-suite-evaluation-2026-09-21.md`).
+
+**The finding, in one paragraph.** The suite is not fake and it is not wrong. It is ~1550 tests aimed
+almost entirely at one layer — pure JVM logic — while the bug history lives in three places that
+layer, *as currently written*, cannot reach: lifecycle ordering, real-device event timing, and
+fixtures that agree with the code instead of with the device. Of 18 ledger defects, **3** would have
+been caught by a missing pure-unit test. 75% of the test budget sits at the layer that caught 3 of
+18; the layer that would have caught the most (**5** — replayed device streams) holds 1.9% of it.
+The problem was never test *quantity*. It was **altitude**.
+
+**What this doc is not: a shopping list.** We are not adding Robolectric and we are not adding an
+emulator suite — see *Considered and deferred* at the end, with the trigger that would change that.
+Every layer below runs with what is already in this repo. The two practices carrying most of the
+value are **L2, replay with a counterfactual** and **rule (b), fixture honesty**: both possible
+today, both currently optional, and between them they cover 8 of the 18 defects.
+
+## Routing table — symptom to layer
+
+| The report says | Layer |
+|---|---|
+| a number on a screen is wrong, a rule decided wrong | **L1** pure JVM unit |
+| anything about the accessibility service, counters, re-blocks, spurious triggers | **L2** — replay a capture, always first |
+| the overlay came back / stayed / skipped its countdown / needed two taps | **L3** pure lifecycle decision |
+| the code is right and the shipped data or copy is wrong | **L4** data/asset gate |
+| works on the bench Pixel, crashes on an older phone | **L5** lint |
+| OEM launcher timing, PiP, the service dying overnight | **L6** bench device — `scripts/device-qa.sh all` for the recurring checks, `device-tester` for the rest. Confirm here, never discover here |
+| a test fails only on one variant, one runner, or one ordering | not a layer — **rule (f)**: shared process state, and the reported test is the victim. If it won't reproduce locally, it may be a race that only loses on a slow runner (measured: a class-boundary `JUnitCore` gate found 0 of 158 classes leaking, twice) — instrument where it happens (CI, in parallel) rather than hunting harder where it doesn't |
+
+---
+
+## L1 — Pure JVM unit: `app/src/test/`, no Android types
+
+**Catches:** value and decision logic over inputs you hand it. Wrong arithmetic, wrong branch, a
+missing case in a rule. ~75% of the suite; fast, and the right default for anything in `domain/`.
+
+**Blind to:** ordering, timing, wiring, and every input shape nobody thought to construct.
+
+**Worked example — #36 (2500 interventions in one day).** The four gates deciding whether to *show*
+an overlay had 49 exhaustive, correct tests. Nothing ever asked the **count** question separately, so
+a green show-gate suite gave zero signal about counting. The test that eventually caught it asserted
+the ceiling **as a number** and failed on its first run; written as "and there is a cap" it would have
+passed. See also **#31**, fixed by extracting the async foreground re-check into `BlockLaunchGate` —
+once a decision is a pure object, this layer can hold it.
+
+**How to add one:** extract the decision into a pure function or object under `domain/`, feed it
+constructed inputs, and assert **the number the user's screen would show**, never which internal
+branch ran. A test asserting "the bypass check returned false" passes on the buggy build too.
+
+**Cost:** minutes to write, milliseconds to run, inside `./gradlew test`.
+
+## L2 — Recorded-event replay with a counterfactual: `app/src/test/resources/a11y-captures/`
+
+**Catches:** "the device does not produce the stream the code assumes" — the largest single bucket,
+**5 of 18**. Wrong trigger, wrong event type, raw-versus-corrected metrics. This is the best thing in
+the repo and it is funded at 1.9%. **It is the headline practice of this document.**
+
+**Worked examples.** **#26**, "I changed my mind" needing two taps: pure launcher timing that *the
+bench Pixel never reproduced once*, closed by replaying the stream. **#28b**: one slow thumb scroll
+counted as 5–6 — the tests asserted the number the *code* produced (one per event past a debounce),
+never the number the *thumb* produced. **#41**: the same own-window rule reached through the
+awareness overlay instead of the block overlay, with no capture to contradict the model. **#7**: the
+timer not starting on re-entry via Recents, because every test pulled the same lever
+(`WINDOW_STATE_CHANGED`) and the device sometimes delivers only content-change events.
+
+**How to add one:**
+
+1. Reproduce on the device with `scripts/a11y-capture.sh <name> [seconds]` running (needs a debug
+   build, or a release build with Settings → About → tap Version 7× → Debug Logging on).
+2. Commit the `.jsonl` under `app/src/test/resources/a11y-captures/` with its `#` header filled in:
+   `# device:`, `# HOW:`, and `# EXPECTED (test oracle):` — **a fixture with no oracle cannot fail**,
+   and `A11yCaptureReplayTest` asserts every capture has one.
+3. Write the assertion that **fails** on it. Then fix.
+4. **Write the counterfactual in the same PR**: run the *pre-fix* rule over the same capture and
+   assert it still fails (`A11yCaptureReplayTest.kt:309` is the pattern). Without it, a capture that
+   quietly stops reproducing leaves a green test asserting nothing.
+
+**Cost:** ~2 hours per report, nearly all of it on the device. Milliseconds forever after, inside
+`./gradlew test`. No new dependency — the script, the codec and the loader already exist.
+
+## L3 — Pure lifecycle decision, extracted from `BlockOverlayActivity`
+
+**Catches:** lifecycle *ordering*, the second-largest bucket. A countdown that keeps ticking while
+stopped; a re-delivery into a `singleInstance` activity that reuses the previous package's state; a
+walk-away racing `finish()`.
+
+**Worked examples:** **#8** (tab out mid-delay, wait, come back and the delay is skipped — the
+countdown was a plain `LaunchedEffect` that kept ticking while backgrounded); **#15** (switching
+between two blocked apps showed the new app's name over the old frozen ring); **#26** (the
+finish/`GLOBAL_ACTION_HOME` race). All three are decisions about a *sequence of lifecycle events*,
+and a sequence of lifecycle events is data.
+
+**How to add one — this is the shape, and it is not Robolectric.** `domain/block/OverlayLifecycle` is
+the pure decision class. Each Activity lifecycle callback hands it the platform facts only an Activity
+can know (`isFinishing`, `isChangingConfigurations`, `isDestroyed`, whether the lifecycle is at least
+STARTED) and gets back an ORDERED list of `Effect`s — `MarkOverlayInactive`, `Finish`,
+`ArmWalkAwayWindow`, `GoHome`, and the rest of the sealed `Effect` interface — which
+`BlockOverlayActivity` runs through one `when` over that sealed interface. Two test files drive it:
+`OverlayLifecycleTest` exercises the state machine in isolation, and `OverlayLifecycleGuardTest` drives
+the same class against the **real** `BlockLaunchGuard`, with counterfactuals that run the pre-fix rule
+over the same sequence. An ordering test is an ordinary JVM list of events, and the reversed-order
+counterfactual of rule (d) costs one more list. **This class is now the model** — read it before adding
+the next lifecycle assertion, and put new ones there instead of inventing a parallel model.
+
+**What this honestly does not catch:** that `BlockOverlayActivity` actually *calls* `OverlayLifecycle`
+on every callback and runs every `Effect` it returns. That residue is the whole argument for the
+deferred layers below. Mitigate it by keeping the adapter small enough to read in one screen, and by
+pinning the forwarding with an absence/count-style assertion per rule (e) —
+`BlockOverlayLaunchContractTest` and `BlockOverlayWalkAwayContractTest` are that source-level
+contract today.
+
+**Cost:** one extraction, then minutes per test inside `./gradlew test`. No new dependency, no
+runtime download, no slowdown of the existing suite.
+
+## L4 — Data and asset gates
+
+**Catches:** the code is right and the **data** is wrong. Nothing else can see this class.
+
+**Worked example — the content filter.** A 274k-domain upstream blob blocked `virginia.gov`,
+`purdue.edu` and, through parent-domain walking, every site on `wordpress.com`. *Every unit test was
+green throughout, because they ran against a hand-written 2-entry fake blocklist.*
+`ContentFilterAssetTest` now parses the **shipped** asset with the app's **own** parser and asserts
+properties: entry ceiling, no `.gov`/`.edu`/`.mil`, no public suffix, no allowlist collision, plus a
+~65-domain benign corpus that must match via neither layer. `ProtectionAlertCopyTest` does the same
+shape for copy, iterating the real `ProtectionFault` enum against the real `strings.xml`.
+
+This layer also reaches **#14** cheaply. The daily limit never fired because `EvaluateBlockUseCase`
+read `SUM(durationMs)` over a column nothing ever wrote, and every test mocked the repository call. A
+schema gate asserting **no query reads a column no insert writes** sees that with no device at all.
+
+**How to add one:** load the real artifact, parse it with production's parser, assert properties —
+never sample it, never restate it in the test. **Delete a guard by hand once and confirm the gate
+fails**; otherwise it is a green tick, not a gate.
+
+**Cost:** about an hour, once.
+
+## L5 — Lint: the API-level gate
+
+**Catches:** the one class JVM tests are structurally blind to. `minSdk` is 26, so an API 28 call
+compiles, passes every unit test, and works on the bench Pixel 3 (API 31). On a real Android 8 phone
+it is a `NoSuchMethodError`.
+
+**Worked example.** `AccessibilityEvent.getScrollDeltaX/Y()` (API 28) sat inside `toRecord()`, which
+runs for **every** accessibility event — on API 26–27 the service died on the first one and blocking
+never worked at all. Two more `AppOpsManager.unsafeCheckOpNoThrow()` calls (API 29) shipped as
+byte-identical copies of each other; the duplication is what made it two bugs instead of one.
+
+**How to keep it:** nothing to add. `lintDebug` gates CI with `abortOnError = true`. Every `android.*`
+API above 26 goes behind a `Build.VERSION.SDK_INT` check, and behind **one shared helper** if it has
+two callers (`util/UsageAccess.kt`). **Never add a `lint-baseline.xml` for errors** — a baseline for
+correctness errors is a list of bugs nobody reads again.
+
+**Cost:** seconds, already paid.
+
+## L6 — Bench-device QA: the Pixel 3
+
+**Catches:** what nothing else can. **#19** (SystemUI's own PiP *menu* window also carries
+`pictureInPicture=true` and shadows the app window), **#23** (the service dying overnight while
+Settings still showed a green tick — "enabled" and "actually bound" only diverge under real memory
+pressure).
+
+**The recurring checks at this layer are SCRIPTED: `scripts/device-qa.sh all`** (9 cases, minutes,
+PASS/FAIL table, nonzero exit). Run it before any hand-walk; `device-tester` is for the
+exploratory cases the script does not cover, judged from the screenshots it dumps. Crucially, this
+layer is **not** a Maestro suite and must not become one: a `UiAutomation` session suppresses every
+other accessibility service, and Nudge *is* one — so a Maestro flow silently disables the feature
+under test. The measurement, the ADB-plus-logcat oracle that replaces it, and the four device facts
+it encodes are in `docs/TESTING.md` → "L6 — Release-gate device QA".
+
+**This layer confirms a fix; it is a poor place to discover one.** #26 never reproduced here once.
+Rules: the bench Pixel carries a **release-signed** build (a plain debug build has different
+signature and grant behaviour); **only one agent drives the device at a time** (`device-qa.sh`
+takes the shared lock itself); anything the script does not cover is delegated to `device-tester`
+with concrete cases and expected outcomes, never tap-walked by the author. When the device does
+show you something, the output of that session is a **capture** (L2), not a memory.
+
+**Cost:** a device cycle, serialised. Never in CI.
+
+---
+
+## The rules
+
+### (a) Every bug fix names its layer
+
+The PR body carries one line: **"Layer L1–L6: here is the test at that layer, or here is why that
+layer is not worth building for this bug."** This is the cheapest item on the list and it is exactly
+what would have stopped #36 — the show-gates had 49 green tests and the author had every reason to
+feel covered. The question never asked was *"what layer does the count question live at?"*
+
+**A source-grep contract test is never the answer to an ordering bug.** This repo learned that the
+expensive way (`tasks/lessons.md`, "If you are writing a test to police a rule, the design is
+wrong"): a regex scanner was written to enforce that every writer calls `requestRefresh()`; the right
+fix was to delete the rule and have the updater collect its own sources of truth. Ask first whether
+the invariant can be made **unwritable**, then whether a behavioural test at L1–L4 can hold it, and
+only then reach for source text.
+
+### (b) Fixture honesty: derive identity constants, never retype them
+
+**A test must never hand-type a value that production reads from `BuildConfig`, the manifest, a
+`build.gradle.kts` field, a production `const`, or an enum.** Derive it or import it. A hand-typed
+constant makes the test agree with its author instead of with the device, and both sides of the
+comparison then agree on a value that exists nowhere. **This is the second headline practice:** an
+afternoon's work, nothing new in the build, and the afternoon it took closed a bug that was live at
+the time of writing (#33) and had been for months.
+
+**The identity offenders are closed** (#48, then the `InstalledAppsRepositoryTest` tail). `NudgeIdentity`
+reads the `applicationId` off `BuildConfig` and the namespace off a real class, the five files that
+hand-typed `"com.astraedus.nudge"` as the app's own package now derive it, and
+`OwnClassNamespaceContractTest` asserts the two identities are different strings, that both
+production namespaces equal the real one, and that the own-window predicate answers yes for real
+class names and no for the applicationId. `NudgeAccessibilityService.shouldClearForOwnPackageEvent`
+no longer takes an identity parameter at all, so the specific mistake **#33** shipped is a compile
+error rather than something a test has to be watching for — rule (a)'s *make it unwritable* applied
+to the case that wrote this rule. The same pass closed the DB-version and `BlockMode` rows
+(`NUDGE_DB_VERSION` and `BlockMode.entries` are read, not retyped).
+
+One live offender remains:
+
+| Offender | What it retypes | Why it is wrong |
+|---|---|---|
+| `domain/sitting/SittingTrackerTest.kt:19` | a 5-minute `returnWindowMs` where production wires `PASSTHROUGH_RETURN_WINDOW_MS = 2 minutes` | no test verifies that production wires the real constant |
+
+**Where the generalisation lives now:** `BlockOverlayLaunchContractTest` reads the namespace out of
+`build.gradle.kts` and asserts `MAIN_APP_ACTIVITY_CLASS` equals `"$namespace.MainActivity"` — *"the
+same mismatch that left `shouldClearForOwnPackageEvent` dead for months"*. That was the right fix
+applied to exactly one constant; `NudgeIdentity` (test source) is the same fix applied to the app's
+two identities, and it is what a new fixture reaches for instead of typing either of them out.
+
+### (c) An accessibility report gets a capture before a fix is designed
+
+**Any issue about the accessibility service gets a committed capture with an oracle, recorded with
+`scripts/a11y-capture.sh`, before the fix is designed.** Not after, not optionally. The harness, the
+script, the oracle discipline and the protocol in
+`docs/architecture/accessibility-event-pipeline.md` all already exist; the only missing piece was
+that using them was optional, and that is the bucket holding 5 of 18 defects.
+
+`.github/ISSUE_TEMPLATE/bug_report.md` asks the reporter for the log; when they cannot produce one,
+capture the closest local repro yourself. **Theorising about an event stream you have not recorded is
+how #28a shipped** — the model ("a foreign package fired a window event → the user left") was simply
+false, and no recorded stream existed to contradict it.
+
+### (d) A fix that closes a race by ordering owes its reversed-order counterfactual
+
+If the fix is "do A before B", the same PR asserts that **B-before-A still fails**. A test that only
+proves the current order works cannot tell a reader whether the order is load-bearing, and the next
+refactor reorders it back. This is the `A11yCaptureReplayTest` counterfactual pattern applied to code
+order rather than to data; at L3 it costs one extra list of events.
+
+### (e) Source-grep assertions: check an absence or a discovered count, never a presence
+
+This fell out of reading all 21 source-grep contract tests present at `52f827e` (new ones have landed since; apply the rule to those too). The assertions that survive a faithful refactor check
+either an **absence of a whole defect class** (`assertFalse(source.contains("CoroutineScope("))`, no
+`mutableStateOf`, no `INTERVAL_DAILY`, no `onBackPressed` override) or a **count over a discovered
+set** (exactly one `wasBlocked = true` writer; this set of preferences equals that set). The ones
+that rot check the **presence of a specific spelling**. That is a sharper rule than "source-grep
+tests are bad", and it tells an author which kind to write. Apply it before adding one, not after.
+
+### (f) A test that leaves a PROCESS-GLOBAL side effect cleans it up, in the test that made it
+
+`kotlinx-coroutines-test` registers `ExceptionCollector` as a process-global
+`CoroutineExceptionHandler`. The first `runTest` in a fork arms it for the life of that JVM, and
+from then on any coroutine exception with no handler in its own context is added to a static list.
+While no `runTest` is active nobody takes it, so it waits — and the next `runTest` **anywhere in
+the fork** throws `UncaughtExceptionsBeforeTest` at its first line.
+
+That is what [#53](https://github.com/astraedus/nudge/issues/53) was. `CrashSafeScopeTest`'s
+counterfactual has to let a throwable escape a bare `SupervisorJob()` scope — the claim IS that it
+reaches the process-killing path — and it left that throwable in the queue. The victim was
+`InterventionsViewModelTest`, three packages away, on the release variant only, because Gradle
+walks the test classes in a different order per variant. Re-running the job "fixed" it.
+
+**The shape to recognise, beyond coroutines:** a test that installs a default uncaught-exception
+handler, replaces a `Dispatchers.setMain` delegate, mutates a system property, swaps a singleton,
+or starts a thread that outlives it, has written into state the whole fork shares. Restore it in
+`@After`, in the class that wrote it — `LeakedCoroutineExceptions.drain()` is that cleanup for the
+coroutine case, and `LeakedCoroutineExceptionsContractTest` pins the pairing.
+
+**And write the regression test at the altitude the defect lives at.** Nothing inside either class
+could see this one: both pass alone. `GlobalCollectorNotLeakedTest` runs the offender through
+`JUnitCore` and then asserts the global state it left is clean — a whole class is the unit under
+test, because "what one class leaves for the next" is the thing that was broken. When a green
+suite fails only on one variant, one runner or one ordering, **suspect shared process state before
+suspecting the test that failed**: the reported test is the victim, not the defect.
+
+**The listed example was the next occurrence, and listing it in prose was not the same as gating
+it.** #53 reopened on `v1.18.4`: `HomeBlockedTileTest` failed on the `main`-push CI run, on
+`:app:testReleaseUnitTest`, with the identical `UncaughtExceptionsBeforeTest` shape — and the
+`Dispatchers.setMain` delegate the paragraph above already named as one instance of this shape was
+the actual offender this time, still ungated. `resetMain()` is not a neutral cleanup in a JVM
+unit-test fork: with no Android main looper, it restores `MissingMainCoroutineDispatcher`, whose
+`isDispatchNeeded` **throws** rather than returning false. `HomeViewModel` named `Dispatchers.IO`
+in `flowOn` at two points in its `uiState` chain, a real thread-pool step outside any
+`TestScope`, so a test's `@After` could call `resetMain()` while that step was still running; when
+the pool thread finished and tried to resume its `Dispatchers.Main` continuation, the throw landed
+as an uncaught `CompletionHandlerException` in the same process-global `ExceptionCollector`, and
+the next `runTest` anywhere in the fork paid for it. This raced — ~4% of CI runs, measured over 12
+parallel `./gradlew test` runs — and never reproduced on the dev machine at all, because the local
+suite (52s) is roughly 4.5x faster than the CI job (3m54s) and the race only loses on a slow
+runner.
+
+The fix has three layers, in order of how load-bearing each one is: (1) the off-main dispatcher is
+now **injected** (`di/DispatcherModule`, `@IoDispatcher`) rather than named as `Dispatchers.IO`
+inside the ViewModel, which removes the background worker outright — a test hands in its own test
+dispatcher, so there is no pool thread left to lose the race to; (2) `MainDispatcherRule` (a
+`TestWatcher`) installs `Dispatchers.Main` in `starting()` and does `resetMain()` +
+`LeakedCoroutineExceptions.drain()` in `finished()`, which runs *after* the class's own `@After`
+methods, as the second-layer sweep of the same race window; (3) `MainDispatcherResetLeakTest` is
+the reversed-order counterfactual (rule (d)) that pins the mechanism itself — a live
+`Dispatchers.Main` coroutine carried across `resetMain()` leaks, the identical coroutine joined
+*before* `resetMain()` does not. `ViewModelDispatcherContractTest` and an addition to
+`LeakedCoroutineExceptionsContractTest` gate the shape as an absence (rule (e)): no `*ViewModel.kt`
+under `ui/` contains the token `Dispatchers.`, and no test file contains `Dispatchers.setMain(`
+except `MainDispatcherRule` and the gate itself. Match the receiver, not just `setMain(` — the
+first version of that gate reported three files, because `resetMain(` contains `setMain(`.
+
+**A correction to the paragraph above, measured while writing this.** It claims
+`GlobalCollectorNotLeakedTest` "fails with the drain removed, passes with it". Deleting
+`CrashSafeScopeTest`'s `@After` drain by hand today leaves it **green**: the counterfactual test's own
+closing `assertTrue(…, LeakedCoroutineExceptions.drain())` both proves and *consumes* the leak, so
+the `@After` call is insurance for a future case added to that class rather than the thing keeping
+the collector clean. The gate does have teeth — removing BOTH drains fails it, by name — but the
+narrower claim was never true. Delete-the-guard-by-hand is only a proof if you delete *every* guard
+that covers the same property.
+
+**Measured, and worth recording so it is not re-proposed:** a class-boundary gate driven by
+`JUnitCore` — drive every test class through it one at a time, drain the collector before and
+after each, name the class that leaves something — was built exactly as the 2026-09-27 reopening
+comment prescribed, and run over all 158 test classes at a 400ms settle and again at a 40-second
+settle. It found **zero** leakers, both times, because the defect is a timing race that a fast,
+serial, single-machine run cannot reproduce. **A class-boundary `JUnitCore` gate is not the answer
+for a timing race** — it answers "did this class leave something", which is a different question
+from "is this race slow enough to lose on the runner we actually ship on". What found the second
+leaker was `LeakProbeHandler`, a second process-global `CoroutineExceptionHandler` (off unless
+`-Dnudge.leakprobe=1`) run 12 times in parallel on `ubuntu-latest` — 1 of 12 failed — plus setting
+`exceptionFormat = FULL` and `STANDARD_ERROR` on the test tasks, because
+`UncaughtExceptionsBeforeTest` carries the actual offender as a **suppressed** throwable that
+Gradle's default `SHORT` format silently drops.
+
+---
+
+## What NOT to do
+
+- **No blanket coverage target.** The `>90% domain` line in `docs/TESTING.md` stays aspirational and
+  unenforced. The caption-rule bug had fine line coverage and five green tests; the defect was input
+  *shape*. A coverage gate would reward writing more of the 75% that caught 3 of 18.
+- **Do not mutation-test the suite.** Too slow here, yield too low. Keep the targeted version this
+  repo already practises: when you add a **gate**, delete the guard once by hand and confirm the gate
+  fails (done for `UsageAccess.kt` and the `NewApi` gate). Anything broader is a green tick.
+- **Do not answer an ordering bug with another source-grep contract test.** See rule (a).
+- **Do not write Compose UI screen tests.** The bugs are in lifecycle and wiring, not rendering.
+- **Do not chase #24** (Reddit scroll freeze). No root cause, no reproduction, reporter rebooted and
+  closed it. It is in the ledger for completeness and stays closed.
+- **Do not delete the counterfactual tests to save lines.** They are the reason the replay fixtures
+  can be trusted at all.
+- **Do not delete any contract test now.** The list below is a *when you next touch this file* list,
+  not a cleanup task. Deleting them today buys maintenance relief and zero bugs.
+
+### Contract tests: migrate when next touched
+
+A first pass of the evaluation reported "13 of 21 pin a spelling" (the 21 present at `52f827e`). **That number was a sampling
+artifact and is wrong** — reading all 21 gives three buckets, and the correction is itself an
+instance of rule (b): a number that came from a sample rather than from the source. The mechanism
+(`contains("someCall(")`) is identical across the good and the bad ones; what differs is the property
+a file's assertions *mostly* establish, so every bucket below is a majority judgement, not a verdict
+on every assertion in the file.
+
+**Keep as they are (8), invariant-grade:** `BlockOverlayLaunchContractTest`,
+`EventDispatchOrderContractTest`, `SharedNamespaceUniquenessTest`, `BlockedCountSemanticsContractTest`,
+`WidgetObservationContractTest`, `WidgetManifestContractTest`, `WidgetStrictModeContractTest`,
+`BlockOverlayWalkAwayContractTest`.
+
+**Mixed, majority-invariant — migrate the named assertion, keep the structural half (7):**
+`MonitorServiceContractTest` (literal copy `"Nudge is active"`, importance constant names, a
+hand-listed toggle-site enumeration) · `ServiceLifecycleContractTest` (`catch (_: IllegalStateException)`,
+`var isRunning`, a hand-listed caller set) · `WatchdogDebugTriggerContractTest` (`ProtectionCheck.run(`,
+the literal broadcast action) · `OverlayBackAndInsetsContractTest` (a `Surface(` assertion that pins
+**whitespace**) · `LivePermissionStateContractTest` (presence spellings for `ContentObserver`,
+`ON_RESUME`) · `InterventionsDelegationContractTest` (`topBlockedApps(events, sinceMs = rangeStart`,
+an **argument name**) · `ScreenTimeSourceContractTest` (presence spellings `perAppOn(` / `totalOn(`).
+
+**Migrate or delete when next touched (6), majority spelling-pinning** — the invariant is real, the
+assertion is a transcript of today's code:
+
+| File | What it rests on |
+|---|---|
+| `service/WebDomainEnforcementContractTest.kt` | pins source **formatting** inside a multi-line constructor call |
+| `service/HomeScreenPassthroughContractTest.kt` | `lastPackage = null`, `lastDomain = null`, `is SittingEvent.Ended -> clear()`; its two ordering tests are worth saving |
+| `data/preferences/ImportedSettingsWriteContractTest.kt` | `settings.$field?.let` — rewriting it as `if (x != null)` with identical behaviour breaks the test; its single-transaction count is worth saving |
+| `ui/screens/home/HomeTileAffordanceContractTest.kt` | `assertEquals(6, statCardCallSites().size)` — a literal count an unrelated new stat card breaks; the shared-label cross-check is worth saving |
+| `ui/screens/stats/ChartSelectionContractTest.kt` | five assertions pinning exact wiring text; the `!contains("mutableStateOf")` absence check is the one to keep |
+| `ui/screens/stats/StatsInsightEntryContractTest.kt` | literal card copy and icon names; "is it explained?" proxied by counting string literals over 20 characters |
+
+An independent second read of the same 21 files scored them 16 invariant / 5 spelling. Both reads
+agree on the five most fragile files (`ImportedSettingsWrite`, `WebDomainEnforcement`,
+`OverlayBackAndInsets`, `HomeTileAffordance`, `ChartSelection`) — treat those as settled. It put
+`HomeScreenPassthroughContractTest` and `StatsInsightEntryContractTest` in the invariant bucket, and
+argued `EventDispatchOrderContractTest` and `InterventionsDelegationContractTest` are
+majority-ordering despite one fragile assertion each. Those four are **contested: read the file
+before migrating it**, and apply rule (e) per assertion rather than per filename.
+
+Two of the mixed set — `MonitorServiceContractTest` and `ServiceLifecycleContractTest` — contain
+**hand-listed enumerations of call sites**. That is the exact shape `tasks/lessons.md` condemns, where
+the right answer was to delete the rule rather than re-express it. Treat those two as **design
+questions**, not migration tasks: change the design so the enumeration is unnecessary.
+
+---
+
+## Considered and deferred
+
+Both of these are real, both are what a standards survey recommends, and both are **deferred on
+purpose**. Recorded here so the next person does not re-derive the argument, and so the decision gets
+reversed on evidence rather than on mood.
+
+**Robolectric** (host a real `Activity` or `AccessibilityService` inside the JVM). It is the textbook
+answer to the L3 bug class, and it does two things the pure decision class cannot: drive the real
+`onNewIntent`/`onStop` callbacks, and inject events into the real service via
+`ShadowAccessibilityService`.
+
+- *Cost:* a large Android runtime artefact downloaded and cached per SDK level, plus a **permanent
+  slowdown of every `./gradlew test` run** — a Robolectric test boots a simulated Android environment
+  and is orders of magnitude slower than the pure tests that make up 75% of this suite. The fast
+  local loop is the thing this repo leans on hardest; it is not worth trading for a simulation.
+- *And it is still a simulation:* it does not model real scheduler or binder jitter, which is exactly
+  what produced #26.
+- *Trigger to revisit:* **a second lifecycle-ordering defect after the pure lifecycle extraction
+  lands.** One more #8-shaped bug that the pure decision class provably could not have caught means
+  the extraction is not enough and the adapter needs real hosting. Until then, extract further.
+
+**Instrumented emulator scenarios** (`app/src/androidTest/`, a managed device, UI Automator driving a
+real second app). The only layer that sees true cross-app window ordering, real SQLite and the real
+DI graph, and the only route to "is this app usable on Android 8" — a question `docs/TESTING.md`
+honestly flags as open.
+
+- *Cost:* emulator minutes and emulator flake, a new CI job to keep green, and the highest
+  hours-per-bug on the list. It would have caught **1** of the 18 ledger defects (#14) — and an L4
+  schema gate catches that one for an hour of work.
+- *Trigger to revisit:* a defect that only a real second app in the foreground could have caught, or
+  a decision to support API 26–27 as a claim rather than as a compile constraint.
+
+The principle behind both deferrals: **add a layer when a bug proves the current layers cannot see
+it, not when a report says the layer is standard.** The two practices funded instead — replay with a
+counterfactual, and fixture honesty — cover 8 of 18 defects, need no new dependency, and make the
+tests already in this repo honest, which is the cheaper half of the same goal.

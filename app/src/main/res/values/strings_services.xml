@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="service_disabled_title">Nudge is off</string>
+    <string name="service_disabled_body">Blocking is turned off</string>
+    <string name="service_degraded_title">Nudge is not blocking</string>
+    <string name="service_permission_body">Accessibility access is off. Tap to turn it on.</string>
+    <string name="service_stopped_body">Your phone stopped Nudge. Tap to turn accessibility off and on again.</string>
+    <string name="service_active_title">Nudge is active</string>
+    <string name="service_active_body">Blocking is on</string>
+    <string name="service_counter_today">today: %1$d</string>
+    <string name="service_count_items">items</string>
+    <string name="service_count_taps">taps</string>
+    <string name="service_count_scrolls">scrolls</string>
+    <string name="service_count_reels">reels</string>
+    <string name="service_count_shorts">shorts</string>
+    <string name="service_count_videos">videos</string>
+    <string name="service_count_explore">explore</string>
+    <string name="service_count_foryou">for you</string>
+    <string name="service_time_left">%1$s left</string>
+    <string name="service_duration_hours_minutes">%1$dh %2$dm</string>
+    <string name="service_duration_minutes">%1$dm</string>
+    <string name="service_duration_seconds">%1$ds</string>
+    <string name="service_covered">Blocked by Nudge</string>
+    <string name="service_covered_feature">%1$s blocked by Nudge</string>
+    <string name="service_this_tab">This tab</string>
+    <string name="service_feature_explore">Instagram Explore</string>
+    <string name="service_feature_tiktok">TikTok Feed</string>
+    <string name="service_auto_kick_cooldown">Auto-kick cooldown</string>
+    <string name="service_web_cooldown">Auto-kick cooldown — %1$s</string>
+</resources>

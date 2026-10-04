@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Nudge - 应用拦截</string>
+    <string name="accessibility_service_description">Nudge 会检测当前前台应用，并应用你的拦截规则。所有数据都保存在设备上。</string>
+    <string name="notification_channel_name">Nudge 监控</string>
+    <string name="notification_channel_description">显示 Nudge 的应用监控状态</string>
+    <string name="protection_alert_channel_name">拦截状态提醒</string>
+    <string name="protection_alert_channel_description">拦截停止时通知你</string>
+    <string name="protection_alert_accessibility_title">Nudge 已停止拦截</string>
+    <string name="protection_alert_accessibility_body">Nudge 的无障碍权限已关闭，应用拦截已停止。点按以重新开启。</string>
+    <string name="protection_alert_crashed_title">Nudge 已停止拦截</string>
+    <string name="protection_alert_crashed_body">系统关闭了 Nudge。无障碍开关仍显示为开启，但拦截不会自动恢复。请在无障碍设置中关闭 Nudge 后重新开启，或重启手机。点按查看操作步骤。</string>
+    <string name="protection_alert_service_title">系统反复停止 Nudge</string>
+    <string name="protection_alert_service_body">系统正在后台关闭 Nudge，拦截可能无法稳定运行。点按查看状态。</string>
+    <string name="protection_alert_blocked_title">Nudge 无法自行重新启动</string>
+    <string name="protection_alert_blocked_body">系统阻止 Nudge 重新启动，拦截可能无法稳定运行。打开 Nudge 即可再次启动。开启“显示在其他应用上层”权限有助于自动恢复。点按查看操作步骤。</string>
+    <string name="app_name_short">Nudge</string>
+    <string name="widget_today_label">Nudge：今日统计</string>
+    <string name="widget_today_description">一览今日屏幕使用时间、拦截次数和主动离开次数。</string>
+    <string name="widget_top_blocked_label">Nudge：拦截最多的应用</string>
+    <string name="widget_top_blocked_description">显示最近 7 天拦截次数最多的应用。</string>
+    <string name="widget_protection_label">Nudge：拦截状态</string>
+    <string name="widget_protection_description">显示拦截状态，并开启或关闭拦截。</string>
+    <string name="widget_today_title">今日</string>
+    <string name="widget_today_screen_time">屏幕使用时间</string>
+    <string name="widget_today_blocked">拦截次数</string>
+    <string name="widget_today_walked_away">主动离开</string>
+    <string name="widget_today_no_usage_access">使用情况访问权限未开启</string>
+    <string name="widget_today_compact_counts">拦截 %1$d 次，主动离开 %2$d 次</string>
+    <string name="widget_top_blocked_rank">%1$d</string>
+    <string name="widget_top_blocked_open">查看使用习惯</string>
+    <string name="widget_top_blocked_title">拦截最多的应用</string>
+    <string name="widget_top_blocked_range">最近 7 天</string>
+    <string name="widget_top_blocked_empty">最近 7 天没有拦截记录。</string>
+    <string name="widget_protection_on">拦截已开启</string>
+    <string name="widget_protection_off">拦截已关闭</string>
+    <string name="widget_protection_degraded">拦截未运行</string>
+    <string name="widget_protection_locked">请在应用内关闭</string>
+    <string name="widget_open_app">打开 Nudge</string>
+    <string name="widget_pin_row_title">添加小组件：%1$s</string>
+    <string name="widget_pin_row_subtitle">仅供调试版本使用。请求桌面添加此小组件。</string>
+    <string name="home_top_blocked_empty">最近 7 天没有拦截记录。添加规则后，记录会显示在这里。</string>
+    <string name="home_top_blocked_row_open">查看 %1$s 的详情</string>
+</resources>

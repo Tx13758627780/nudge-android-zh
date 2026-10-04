@@ -1,0 +1,64 @@
+<resources>
+    <string name="backup_import_title">导入备份</string>
+    <string name="backup_import">导入</string>
+    <string name="backup_cancel">取消</string>
+    <string name="backup_ok">确定</string>
+    <string name="backup_import_complete">导入完成</string>
+    <string name="backup_import_failed">导入失败</string>
+    <string name="backup_save_title">保存备份</string>
+    <string name="backup_share_title">分享备份</string>
+    <string name="backup_import_protection_challenge">导入会降低保护强度的设置</string>
+    <string name="backup_preview_rules">要导入 %1$d 条规则吗？</string>
+    <string name="backup_preview_rules_groups">要导入 %1$d 条规则和 %2$d 个分组吗？</string>
+    <string name="backup_duplicates_warning">重复的规则将被跳过。</string>
+    <string name="backup_preview_history">包含 %1$d 条历史记录，其中 %2$d 条为新记录。</string>
+    <plurals name="backup_preview_invalid_entries">
+        <item quantity="other">有 %1$d 个条目无法读取，将不予导入：</item>
+    </plurals>
+    <plurals name="backup_preview_invalid_history">
+        <item quantity="other">有 %1$d 条历史记录无法读取，将不予导入：</item>
+    </plurals>
+    <plurals name="backup_preview_invalid_settings">
+        <item quantity="other">有 %1$d 项设置无法读取，将不予导入：</item>
+    </plurals>
+    <string name="backup_settings_warning">还会恢复应用设置，并覆盖此设备上的现有设置。</string>
+    <string name="backup_outcome_rules">已导入规则：%1$d 条</string>
+    <string name="backup_outcome_groups">已创建分组：%1$d 个</string>
+    <string name="backup_outcome_duplicates">已跳过重复规则：%1$d 条</string>
+    <string name="backup_outcome_history">已恢复历史记录：%1$d 条</string>
+    <string name="backup_outcome_history_duplicates">已存在的历史记录：%1$d 条</string>
+    <string name="backup_outcome_history_invalid">无法读取的历史记录：%1$d 条</string>
+    <string name="backup_outcome_settings">已恢复应用设置</string>
+    <string name="backup_outcome_settings_invalid">无法读取的设置：%1$d 项</string>
+    <string name="backup_outcome_invalid">已跳过无法读取的条目：%1$d 个</string>
+    <string name="backup_more_reasons">……另有 %1$s 个</string>
+    <string name="backup_save_success">备份已保存，包含你的规则、历史记录和应用设置。</string>
+    <string name="backup_save_failure">无法将备份写入该位置。请重试，或选择其他文件夹。</string>
+    <string name="backup_read_failure">无法读取该文件。</string>
+    <string name="backup_invalid_version">版本字段无效或缺失</string>
+    <string name="backup_newer_version">备份版本 %1$s 高于当前支持的版本（%2$s），请更新应用。</string>
+    <string name="backup_all_invalid">未找到有效的规则或分组。全部 %1$s 个条目均无效：\n%2$s</string>
+    <string name="backup_invalid_json">JSON 格式无效：%1$s</string>
+    <string name="backup_invalid_data">数据无效：%1$s</string>
+    <string name="backup_unknown_mode">未知的拦截模式：%1$s</string>
+    <string name="backup_missing_value">缺少字段 %1$s 的值</string>
+    <string name="backup_blank_package">应用包名为空</string>
+    <string name="backup_blank_group">分组名称为空</string>
+    <string name="backup_invalid_timestamp">时间戳必须是大于零的 Unix 时间（毫秒）</string>
+    <string name="backup_unreadable">无法读取</string>
+    <string name="backup_not_boolean">必须为 true 或 false</string>
+    <string name="backup_not_text">必须为文本</string>
+    <string name="backup_not_number">必须为数字</string>
+    <string name="backup_reason_rule">规则 %1$s：%2$s</string>
+    <string name="backup_reason_group">分组 %1$s：%2$s</string>
+    <string name="backup_reason_history">历史记录 %1$s：%2$s</string>
+    <string name="backup_reason_setting">设置“%1$s”：%2$s</string>
+    <string name="backup_invalid_challenge_length">验证字符长度 %1$s 不在 1 到 %2$s 的范围内</string>
+    <string name="backup_field_array">“%1$s”必须为数组</string>
+    <string name="backup_field_object">“%1$s”必须为对象</string>
+    <string name="backup_field_missing_text">“%1$s”缺失或不是文本</string>
+    <string name="backup_field_missing_number">“%1$s”缺失或不是数字</string>
+    <string name="backup_field_boolean">“%1$s”必须为 true 或 false</string>
+    <string name="backup_field_text">“%1$s”必须为文本</string>
+    <string name="backup_unrecognized_diagnostic">无法读取（详细信息：%1$s）</string>
+</resources>

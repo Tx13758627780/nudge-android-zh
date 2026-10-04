@@ -1,0 +1,4 @@
+• The Reels tab disappears from Instagram while your rule is blocking Reels, so there is no tab sitting there inviting the tap. A reel opened from Explore or a message still meets the block screen. On by default, switchable in the rule editor.
+• With a daily limit instead, the tab is there while you have time left and gone the moment it runs out.
+• Open Instagram to Following instead of the home feed (experimental, off by default).
+• Backups carry both new settings.

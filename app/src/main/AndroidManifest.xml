@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- App blocking: detect foreground app -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Overlay: show block/delay screens on top of other apps -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Keep monitoring service alive -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Survive device reboot -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Grayscale mode: granted via ADB only -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Query installed apps -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- QR / barcode scanning (ui/qr/, docs/architecture/qr.md). Requested at runtime only when the
+         scanner opens. The feature is NOT required: a camera-less device must still install
+         Nudge, it just cannot scan (the scan contract returns null on such a device). -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature
+        android:name="android.hardware.camera.any"
+        android:required="false" />
+
+        <!-- Backup is OFF, deliberately, for two independent reasons.
+
+             1. PRIVACY. Nudge holds no INTERNET permission and its listing promises "all data
+                local". Android Auto Backup ignores both: with allowBackup="true" the framework
+                uploads the Room database (every rule, every app the user blocks, their whole usage
+                history) to Google Drive on the user's behalf. An app that advertises local-only
+                data must not have a cloud copy it never mentions.
+
+             2. RELIABILITY. Running a full backup force-kills the app's process. On 2026-09-07 the
+                Pixel's 01:59 `full_backup_package dev.astraedus.nudge` killed Nudge (am_proc_died
+                reason 100); the OS rescheduled both services and Settings reported "Enabled, but
+                your phone stopped it, turn it off and back on to restart blocking". A blocker that
+                is killed nightly by a backup it does not want is a blocker that stops blocking
+                nightly.
+
+             The backup path users actually have is Settings -> Export rules / Import rules
+             (docs/architecture/export-import.md), which is explicit, inspectable, carries usage
+             history, and does not leave the device unless the user sends it somewhere.
+
+             dataExtractionRules covers API 31+, where allowBackup alone no longer governs
+             device-to-device transfer; fullBackupContent covers API 26-30. -->
+    <application
+        android:name=".NudgeApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Nudge"
+        tools:targetApi="36">
+
+        <!-- singleTop: the protection alert and the home-screen widgets both deep-link in here.
+             Without it, tapping a widget while the app is already open stacks a SECOND MainActivity
+             on top of the first, so the back button lands the user on a stale copy of their own
+             dashboard. singleTop instead routes the intent to onNewIntent on the live instance. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Nudge">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.overlay.BlockOverlayActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Nudge.Overlay" />
+
+        <!-- Strict Mode Phase 2: full-screen unlock challenge shown over protected Settings
+             escape routes (accessibility toggle, App Info / Force stop / Uninstall). -->
+        <activity
+            android:name=".ui.lock.StrictModeGuardActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Nudge.Overlay" />
+
+        <!-- Issue #19: PiP defeats the block overlay (e.g. YouTube Shorts). Explains the
+             limitation and deep-links to the per-app picture-in-picture settings toggle. -->
+        <activity
+            android:name=".ui.overlay.PipEscapeActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:theme="@style/Theme.Nudge.Overlay" />
+
+        <!-- Camera scanner behind ScanQrContract. Not exported: only Nudge opens it. Dark
+             framework theme so the window does not flash white before the preview starts.
+             Portrait so a phone turning mid-scan does not recreate the activity and rebind the
+             camera. Android 16 ignores the lock on large screens, which is fine: the layout is
+             size-driven and CameraX handles rotation, hence the two lint suppressions. -->
+        <activity
+            android:name=".ui.qr.QrScanActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            tools:ignore="DiscouragedApi,LockedOrientationActivity" />
+
+        <service
+            android:name=".service.NudgeAccessibilityService"
+            android:exported="false"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <service
+            android:name=".service.NudgeMonitorService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <!-- Android asks for this justification so a Play reviewer can see why "specialUse"
+                 rather than one of the named types. None of them fit: nothing is synced, played,
+                 projected or called; the service exists to hold process priority so the
+                 accessibility binding that does the blocking is not reaped. -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps the on-device app-blocking service running so scheduled and time-limit blocks are enforced while the user is in other apps." />
+        </service>
+
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- An in-place update replaces the process, killing this foreground service.
+                     Android rebinds the accessibility service itself, but nothing restarted
+                     THIS service, and it is the process-priority protection that stops the
+                     accessibility binding being reaped once the screen goes off. Without this
+                     action every update left the app unprotected overnight until a reboot. -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Home-screen widgets (Jetpack Glance). `exported="true"` is mandatory on all three:
+             the launcher is a different process and must be able to broadcast APPWIDGET_UPDATE to
+             them. They carry no data of their own and read through the same repositories the app
+             does, so there is nothing here an exported receiver leaks. -->
+        <receiver
+            android:name=".ui.widget.TodayWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_today_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/today_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".ui.widget.TopBlockedWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_top_blocked_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/top_blocked_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".ui.widget.ProtectionWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_protection_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/protection_widget_info" />
+        </receiver>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+    </application>
+
+</manifest>

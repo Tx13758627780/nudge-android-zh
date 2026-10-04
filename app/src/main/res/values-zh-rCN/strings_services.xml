@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="service_disabled_title">Nudge 已关闭</string>
+    <string name="service_disabled_body">拦截已关闭</string>
+    <string name="service_degraded_title">Nudge 未在拦截</string>
+    <string name="service_permission_body">无障碍权限已关闭。点按以开启。</string>
+    <string name="service_stopped_body">系统停止了 Nudge。点按前往无障碍设置，关闭后重新开启。</string>
+    <string name="service_active_title">Nudge 正在运行</string>
+    <string name="service_active_body">拦截已开启</string>
+    <string name="service_counter_today">今日：%1$d</string>
+    <string name="service_count_items">条内容</string>
+    <string name="service_count_taps">次点击</string>
+    <string name="service_count_scrolls">次滑动</string>
+    <string name="service_count_reels">条 Reels</string>
+    <string name="service_count_shorts">条 Shorts</string>
+    <string name="service_count_videos">条视频</string>
+    <string name="service_count_explore">条探索内容</string>
+    <string name="service_count_foryou">条推荐内容</string>
+    <string name="service_time_left">剩余 %1$s</string>
+    <string name="service_duration_hours_minutes">%1$d 小时 %2$d 分钟</string>
+    <string name="service_duration_minutes">%1$d 分钟</string>
+    <string name="service_duration_seconds">%1$d 秒</string>
+    <string name="service_covered">已被 Nudge 拦截</string>
+    <string name="service_covered_feature">%1$s 已被 Nudge 拦截</string>
+    <string name="service_this_tab">此标签页</string>
+    <string name="service_feature_explore">Instagram 探索</string>
+    <string name="service_feature_tiktok">TikTok 推荐</string>
+    <string name="service_auto_kick_cooldown">自动退出冷却时间</string>
+    <string name="service_web_cooldown">自动退出冷却时间 — %1$s</string>
+</resources>

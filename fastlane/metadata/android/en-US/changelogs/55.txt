@@ -1,0 +1,2 @@
+• Blocking could quietly switch itself off and stay off after an app update, a force stop, or Android restarting Nudge in the background. No block screens, no delays, no daily limits, and nothing on screen to say so. Fixed.
+• If you ever saw the "blocking has stopped" notification and could not work out why, this was why.

@@ -1,0 +1,33 @@
+/*
+ * Gray-screen mode.
+ *
+ * NOT listed in the manifest. The service worker registers this file as a DYNAMIC content
+ * script (chrome.scripting.registerContentScripts), matched against exactly the set of
+ * sites whose rule has `grayscale: true`, and unregisters it when that set is empty. That
+ * is what makes the feature gateable with ZERO colour flash: the docs guarantee registered
+ * CSS is injected "before any DOM is constructed or displayed", whereas a manifest entry is
+ * static (always on) and anything JS-driven has to wait for an async storage read and
+ * therefore paints in colour first.
+ *
+ * Since v0.2 grayscale is PER SITE, so this stylesheet can be live on several unrelated
+ * domains at once. The colour reward below is still YouTube's alone — it is the channel
+ * list that earns it, and no other platform has one. Every other grayscaled site is simply
+ * gray, which is the whole feature there.
+ *
+ * See src/background/grayscale.ts and the CLAUDE.md note on the flash tradeoff.
+ */
+
+html {
+  filter: grayscale(1) !important;
+}
+
+/*
+ * The colour reward. src/content/youtube.ts adds this class once it has confirmed the
+ * current channel is one the user allowed. Going gray -> colour therefore flashes once,
+ * after the channel check resolves; that direction is unavoidable and deliberate — a brief
+ * gray frame on an allowed video is a far better failure than a colour frame on every
+ * video the user is trying not to be pulled into.
+ */
+html.nudge-color {
+  filter: none !important;
+}

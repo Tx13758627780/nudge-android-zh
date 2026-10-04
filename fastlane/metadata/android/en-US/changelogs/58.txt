@@ -1,0 +1,4 @@
+• New: Nuke Mode. Pick a separate list of apps that simply will not open while Nuke is on. No countdown, no breathing, no 2-minute pass.
+• Turn it on and off by scanning a QR code Nudge makes for you (print it, stick it somewhere far away) or any barcode you already own.
+• Lost the code? The only way out is typing a random 64-character code by hand.
+• Your phone, home screen, keyboard and Settings can never be nuked.
